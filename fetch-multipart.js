@@ -382,10 +382,17 @@ export class BodyPart {
   /** @type {Uint8Array} */ #headerBytes
   /** @type {Headers | null} */ #headers = null
   #bodyUsed = false
-  /** @type {ReadableStreamDefaultController<Uint8Array> | null} */ #controller = null
   #closed = false
-  /** @type {ReadableStream<Uint8Array>} */
-  body
+  /** @type {Error | null} */ #error = null
+
+  // Body bytes accumulate here until something accesses `body` or `bytes()` etc.
+  // If the parser finishes the part before the consumer touches it, the bytes
+  // are returned directly (no ReadableStream construction).
+  /** @type {Uint8Array[] | null} */ #pendingChunks = []
+
+  /** @type {ReadableStream<Uint8Array> | null} */ #body = null
+  /** @type {ReadableStreamDefaultController<Uint8Array> | null} */ #controller = null
+  /** @type {((part: BodyPart) => Promise<void>) | null} */ #pullHook
 
   /**
    * @param {Uint8Array} headerBytes
@@ -393,19 +400,7 @@ export class BodyPart {
    */
   constructor(headerBytes, pullHook) {
     this.#headerBytes = headerBytes
-    const self = this
-    this.body = new ReadableStream({
-      start(controller) {
-        self.#controller = controller
-      },
-      async pull() {
-        if (pullHook) await pullHook(self)
-      },
-      cancel() {
-        self.#closed = true
-        self.#bodyUsed = true
-      },
-    })
+    this.#pullHook = pullHook
   }
 
   /** @returns {Headers} */
@@ -419,10 +414,22 @@ export class BodyPart {
     return this.#bodyUsed
   }
 
+  /** @returns {ReadableStream<Uint8Array>} */
+  get body() {
+    if (this.#body === null) this.#materializeBody()
+    return this.#body
+  }
+
   /** @returns {Promise<Uint8Array>} */
   async bytes() {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
+    if (this.#body === null && this.#closed) {
+      if (this.#error) throw this.#error
+      const out = concatChunks(this.#pendingChunks)
+      this.#pendingChunks = null
+      return out
+    }
     return new Response(this.body).bytes()
   }
 
@@ -446,6 +453,12 @@ export class BodyPart {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
     const type = this.headers.get('content-type') ?? ''
+    if (this.#body === null && this.#closed) {
+      if (this.#error) throw this.#error
+      const blob = new Blob([concatChunks(this.#pendingChunks)], { type })
+      this.#pendingChunks = null
+      return blob
+    }
     return new Response(this.body, { headers: { 'content-type': type } }).blob()
   }
 
@@ -468,30 +481,74 @@ export class BodyPart {
     yield* iterateStreamParts(this.body, boundary)
   }
 
+  #materializeBody() {
+    const self = this
+    const pending = this.#pendingChunks
+    this.#pendingChunks = null
+    this.#body = new ReadableStream({
+      start(controller) {
+        self.#controller = controller
+        for (const chunk of pending) controller.enqueue(chunk)
+        if (self.#error) controller.error(self.#error)
+        else if (self.#closed) controller.close()
+      },
+      async pull() {
+        if (self.#pullHook && !self.#closed) await self.#pullHook(self)
+      },
+      cancel() {
+        self.#closed = true
+        self.#bodyUsed = true
+      },
+    })
+  }
+
   // ---- internal: parser ----
 
   _enqueue(chunk) {
     if (this.#closed) return
-    this.#controller.enqueue(chunk)
+    if (this.#controller) this.#controller.enqueue(chunk)
+    else this.#pendingChunks.push(chunk)
   }
 
   _close() {
     if (this.#closed) return
     this.#closed = true
-    this.#controller.close()
+    if (this.#controller) this.#controller.close()
   }
 
   _error(err) {
     if (this.#closed) return
     this.#closed = true
-    this.#controller.error(err)
+    if (this.#controller) this.#controller.error(err)
+    else this.#error = err
   }
 
-  /** True when the controller still has room AND the body has not been closed. */
+  /** Drop incoming bytes; used when the iterator advances past an unread body. */
+  _drain() {
+    this.#closed = true
+    this.#bodyUsed = true
+    this.#pendingChunks = null
+  }
+
   _wantsMore() {
     if (this.#closed) return false
-    return (this.#controller.desiredSize ?? 0) > 0
+    if (this.#controller) return (this.#controller.desiredSize ?? 0) > 0
+    return true
   }
+}
+
+function concatChunks(chunks) {
+  // Always copy. A returned Uint8Array's `.buffer` should be sized to the body,
+  // not the source chunk it was subarray'd from.
+  let total = 0
+  for (const c of chunks) total += c.length
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) {
+    out.set(c, offset)
+    offset += c.length
+  }
+  return out
 }
 
 // ---------- public API ----------
@@ -647,10 +704,10 @@ async function* iterateStreamParts(stream, boundary) {
       if (sourceDone) return
 
       // No part queued and source still running. If the caller iterated past
-      // an unread body, cancel it so subsequent bytes are dropped while we
-      // scan for the next boundary.
+      // an unread body, drop subsequent bytes for it while we scan for the
+      // next boundary.
       const active = parser.activePart
-      if (active) active.body.cancel()
+      if (active) active._drain()
 
       await pumpUntil(() =>
         partQueue.length > 0 || sourceDone || sourceError !== null,
