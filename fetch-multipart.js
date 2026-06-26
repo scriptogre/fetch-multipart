@@ -26,6 +26,7 @@ export class MultipartParseError extends TypeError {
 // ---------- byte search ----------
 
 const utf8Encoder = new TextEncoder()
+const utf8Decoder = new TextDecoder()
 
 // Boyer-Moore-Horspool over a Uint8Array.
 function createSearch(pattern) {
@@ -47,8 +48,8 @@ function createSearch(pattern) {
   }
 }
 
-// Finds a partial occurrence of `pattern` whose suffix touches the end of the
-// haystack. Used to detect a boundary that may be split across two chunks.
+// Finds the start index (within `haystack[from..]`) where a suffix of haystack
+// matches a prefix of `pattern`. Used to detect a boundary split across chunks.
 function createPartialTailSearch(pattern) {
   const needle = utf8Encoder.encode(pattern)
   const byteIndexes = Object.create(null)
@@ -58,12 +59,13 @@ function createPartialTailSearch(pattern) {
     byteIndexes[byte].push(i)
   }
 
-  return (haystack) => {
+  return (haystack, from = 0) => {
     const haystackEnd = haystack.length - 1
+    if (haystackEnd < from) return -1
     const indexes = byteIndexes[haystack[haystackEnd]]
     if (indexes) {
       for (let i = indexes.length - 1; i >= 0; --i) {
-        for (let j = indexes[i], k = haystackEnd; j >= 0 && haystack[k] === needle[j]; --j, --k) {
+        for (let j = indexes[i], k = haystackEnd; j >= 0 && k >= from && haystack[k] === needle[j]; --j, --k) {
           if (j === 0) return k
         }
       }
@@ -108,8 +110,9 @@ export class MultipartParser {
   #state = State.START
   #buffer = null
   #currentHeader = null
-  #currentContent = null
   #remainingBodyBytes = 0
+  #activePart = null
+  #pullHook = null
 
   constructor(boundary) {
     // RFC 2046 §5.1.1 limits the boundary to 1-70 ASCII characters from a
@@ -132,9 +135,13 @@ export class MultipartParser {
     this.#boundaryBytes = utf8Encoder.encode(boundaryPattern)
   }
 
+  /** Internal: the part currently receiving body bytes, or null. */
+  get _activePart() {
+    return this.#activePart
+  }
+
   *write(chunk) {
     // Discard epilogue bytes after the closing boundary (RFC 2046 §5.1.1).
-    // https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
     if (this.#state === State.DONE) return
 
     let index = 0
@@ -143,12 +150,13 @@ export class MultipartParser {
     if (this.#buffer !== null) {
       if (this.#state === State.READING_BODY_UNTIL_BOUNDARY) {
         const carry = this.#buffer
+        this.#buffer = null
         const carryResult = this.#analyzeCarryBoundary(carry, chunk)
 
         if (carryResult.kind === 'none') {
-          this.#append(carry)
+          this.#routeBody(carry)
         } else if (carryResult.kind === 'partial') {
-          if (carryResult.start > 0) this.#append(carry.subarray(0, carryResult.start))
+          if (carryResult.start > 0) this.#routeBody(carry.subarray(0, carryResult.start))
           const tailLength = carry.length + chunk.length - carryResult.start
           const tail = new Uint8Array(tailLength)
           const carryTail = carry.subarray(carryResult.start)
@@ -157,8 +165,8 @@ export class MultipartParser {
           this.#buffer = tail
           return
         } else {
-          if (carryResult.start > 0) this.#append(carry.subarray(0, carryResult.start))
-          yield this.#createPart()
+          if (carryResult.start > 0) this.#routeBody(carry.subarray(0, carryResult.start))
+          this.#finalizeActivePart()
           this.#state = State.READING_BOUNDARY_SUFFIX
           const carryAfterStart = carry.length - carryResult.start
           index = this.#boundaryLength - carryAfterStart
@@ -169,32 +177,26 @@ export class MultipartParser {
         newChunk.set(chunk, this.#buffer.length)
         chunk = newChunk
         chunkLength = chunk.length
+        this.#buffer = null
       }
-
-      this.#buffer = null
     }
 
     while (true) {
       if (this.#state === State.READING_BODY_UNTIL_BOUNDARY) {
-        if (chunkLength - index < this.#boundaryLength) {
-          this.#buffer = chunk.subarray(index)
-          break
-        }
-
         const boundaryIndex = this.#findBoundary(chunk, index)
         if (boundaryIndex === -1) {
-          const partialTailIndex = this.#findPartialTailBoundary(chunk)
+          const partialTailIndex = this.#findPartialTailBoundary(chunk, index)
           if (partialTailIndex === -1) {
-            this.#append(index === 0 ? chunk : chunk.subarray(index))
+            this.#routeBody(index === 0 ? chunk : chunk.subarray(index))
           } else {
-            if (partialTailIndex > index) this.#append(chunk.subarray(index, partialTailIndex))
+            if (partialTailIndex > index) this.#routeBody(chunk.subarray(index, partialTailIndex))
             this.#buffer = chunk.subarray(partialTailIndex)
           }
           break
         }
 
-        if (boundaryIndex > index) this.#append(chunk.subarray(index, boundaryIndex))
-        yield this.#createPart()
+        if (boundaryIndex > index) this.#routeBody(chunk.subarray(index, boundaryIndex))
+        this.#finalizeActivePart()
         index = boundaryIndex + this.#boundaryLength
         this.#state = State.READING_BOUNDARY_SUFFIX
       }
@@ -224,9 +226,10 @@ export class MultipartParser {
           break
         }
         this.#currentHeader = chunk.subarray(index, headerEndIndex)
-        this.#currentContent = []
         index = headerEndIndex + 4 // skip \r\n\r\n
         const contentLength = extractContentLength(this.#currentHeader)
+        this.#activePart = new BodyPart(this.#currentHeader, this.#pullHook)
+        yield this.#activePart
         if (contentLength >= 0) {
           this.#remainingBodyBytes = contentLength
           this.#state = State.READING_BODY_WITH_CONTENT_LENGTH
@@ -240,7 +243,7 @@ export class MultipartParser {
       // body bytes, then expect the boundary to immediately follow.
       if (this.#state === State.READING_BODY_WITH_CONTENT_LENGTH) {
         const bodyBytes = Math.min(this.#remainingBodyBytes, chunkLength - index)
-        this.#append(chunk.subarray(index, index + bodyBytes))
+        if (bodyBytes > 0) this.#routeBody(chunk.subarray(index, index + bodyBytes))
         this.#remainingBodyBytes -= bodyBytes
         index += bodyBytes
 
@@ -254,13 +257,15 @@ export class MultipartParser {
         }
         for (let i = 0; i < this.#boundaryLength; i++) {
           if (chunk[index + i] !== this.#boundaryBytes[i]) {
-            throw new MultipartParseError(
+            const err = new MultipartParseError(
               'Content-Length does not match actual body length',
             )
+            this.#errorActivePart(err)
+            throw err
           }
         }
 
-        yield this.#createPart()
+        this.#finalizeActivePart()
         index += this.#boundaryLength
         this.#state = State.READING_BOUNDARY_SUFFIX
       }
@@ -271,7 +276,6 @@ export class MultipartParser {
           break
         }
         // Discard preamble bytes before the opening boundary (RFC 2046 §5.1.1).
-        // https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
         const openingIndex = this.#findOpeningBoundary(chunk)
         if (openingIndex === -1) {
           const tailStart = chunkLength - (this.#openingBoundaryLength - 1)
@@ -285,18 +289,50 @@ export class MultipartParser {
   }
 
   finish() {
+    // Flush any body bytes still in the carry buffer.
+    if (this.#buffer && this.#state === State.READING_BODY_UNTIL_BOUNDARY) {
+      this.#routeBody(this.#buffer)
+      this.#buffer = null
+    }
     if (this.#state !== State.DONE) {
-      throw new MultipartParseError('Stream ended before final boundary')
+      const err = new MultipartParseError('Stream ended before final boundary')
+      this.#errorActivePart(err)
+      throw err
     }
   }
 
-  #append(chunk) {
-    if (chunk.length === 0) return
-    this.#currentContent.push(chunk)
+  /** Internal: errors the active part's body stream. */
+  _abortActive(err) {
+    this.#errorActivePart(err)
   }
 
-  #createPart() {
-    return new BodyPart(this.#currentHeader, this.#currentContent)
+  /**
+   * Internal: set a callback the active part's body stream invokes when it
+   * wants more bytes. Lets the parser's driver propagate backpressure.
+   *
+   * @param {(part: BodyPart) => Promise<void>} fn
+   */
+  _setPullHook(fn) {
+    this.#pullHook = fn
+  }
+
+  #routeBody(chunk) {
+    if (chunk.length === 0) return
+    if (this.#activePart) this.#activePart._enqueue(chunk)
+  }
+
+  #finalizeActivePart() {
+    if (this.#activePart) {
+      this.#activePart._close()
+      this.#activePart = null
+    }
+  }
+
+  #errorActivePart(err) {
+    if (this.#activePart) {
+      this.#activePart._error(err)
+      this.#activePart = null
+    }
   }
 
   // Detect a boundary whose start lies inside the carry buffer (from the
@@ -330,8 +366,6 @@ export class MultipartParser {
 
 // ---------- BodyPart (implements Body) ----------
 
-const utf8Decoder = new TextDecoder()
-
 function parseHeaderBytes(raw) {
   const headers = new Headers()
   const text = utf8Decoder.decode(raw)
@@ -342,56 +376,51 @@ function parseHeaderBytes(raw) {
   return headers
 }
 
-function concatChunks(chunks) {
-  let size = 0
-  for (const c of chunks) size += c.length
-  const out = new Uint8Array(size)
-  let offset = 0
-  for (const c of chunks) {
-    out.set(c, offset)
-    offset += c.length
-  }
-  return out
-}
-
 /**
  * A MIME body part. Implements the WHATWG Fetch `Body` interface plus a
  * `parts()` method for recursing into nested `multipart/*` bodies.
+ *
+ * The body is a live `ReadableStream<Uint8Array>` that receives bytes as the
+ * parser sees them. Callers must consume each part's body (or cancel it)
+ * before iterating to the next part; iterating past an unread body
+ * auto-drains it.
  */
 export class BodyPart {
-  /** @type {Uint8Array[]} */ #content
   /** @type {Uint8Array} */ #headerBytes
   /** @type {Headers | null} */ #headers = null
-  /** @type {ReadableStream<Uint8Array> | null} */ #body = null
   #bodyUsed = false
+  /** @type {ReadableStreamDefaultController<Uint8Array> | null} */ #controller = null
+  #closed = false
+  #cancelled = false
+  /** @type {ReadableStream<Uint8Array>} */
+  body
 
   /**
    * @param {Uint8Array} headerBytes
-   * @param {Uint8Array[]} contentChunks
+   * @param {((part: BodyPart) => Promise<void>) | null} pullHook
    */
-  constructor(headerBytes, contentChunks) {
+  constructor(headerBytes, pullHook) {
     this.#headerBytes = headerBytes
-    this.#content = contentChunks
+    const self = this
+    this.body = new ReadableStream({
+      start(controller) {
+        self.#controller = controller
+      },
+      async pull() {
+        if (pullHook) await pullHook(self)
+      },
+      cancel() {
+        self.#cancelled = true
+        self.#closed = true
+        self.#bodyUsed = true
+      },
+    })
   }
 
   /** @returns {Headers} */
   get headers() {
     if (this.#headers === null) this.#headers = parseHeaderBytes(this.#headerBytes)
     return this.#headers
-  }
-
-  /** @returns {ReadableStream<Uint8Array>} */
-  get body() {
-    if (this.#body === null) {
-      const chunks = this.#content
-      this.#body = new ReadableStream({
-        start(controller) {
-          for (const chunk of chunks) controller.enqueue(chunk)
-          controller.close()
-        },
-      })
-    }
-    return this.#body
   }
 
   /** @returns {boolean} */
@@ -403,7 +432,7 @@ export class BodyPart {
   async bytes() {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
-    return concatChunks(this.#content)
+    return collectStream(this.body)
   }
 
   /** @returns {Promise<ArrayBuffer>} */
@@ -416,7 +445,7 @@ export class BodyPart {
   async text() {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
-    return utf8Decoder.decode(concatChunks(this.#content))
+    return utf8Decoder.decode(await collectStream(this.body))
   }
 
   /** @returns {Promise<any>} */
@@ -424,9 +453,16 @@ export class BodyPart {
     return JSON.parse(await this.text())
   }
 
+  /** @returns {Promise<Blob>} */
+  async blob() {
+    if (this.#bodyUsed) throw new TypeError('Body already used')
+    this.#bodyUsed = true
+    const type = this.headers.get('content-type') ?? ''
+    return new Blob([await collectStream(this.body)], { type })
+  }
+
   /**
    * Parse this part's body as a nested `multipart/*` message.
-   * Mirrors `Response.prototype.parts()`.
    *
    * @returns {AsyncGenerator<BodyPart, void, unknown>}
    */
@@ -444,13 +480,74 @@ export class BodyPart {
     yield* iterateStreamParts(this.body, boundary)
   }
 
-  /** @returns {Promise<Blob>} */
-  async blob() {
-    if (this.#bodyUsed) throw new TypeError('Body already used')
-    this.#bodyUsed = true
-    const type = this.headers.get('content-type') ?? ''
-    return new Blob([concatChunks(this.#content)], { type })
+  // ---- internal: parser ----
+
+  _enqueue(chunk) {
+    if (this.#cancelled || this.#closed) return
+    try {
+      this.#controller.enqueue(chunk)
+    } catch {
+      this.#cancelled = true
+      this.#closed = true
+    }
   }
+
+  _close() {
+    if (this.#closed) return
+    this.#closed = true
+    try {
+      this.#controller.close()
+    } catch {
+      // Stream may already be in a terminal state.
+    }
+  }
+
+  _error(err) {
+    if (this.#closed) return
+    this.#closed = true
+    try {
+      this.#controller.error(err)
+    } catch {
+      // Stream may already be in a terminal state.
+    }
+  }
+
+  _cancel() {
+    this.#cancelled = true
+  }
+
+  _isClosed() {
+    return this.#closed
+  }
+
+  _desiredSize() {
+    if (this.#cancelled) return Infinity
+    if (this.#controller === null) return 1
+    return this.#controller.desiredSize ?? 0
+  }
+}
+
+async function collectStream(stream) {
+  const reader = stream.getReader()
+  const chunks = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      chunks.push(value)
+      total += value.length
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) {
+    out.set(c, offset)
+    offset += c.length
+  }
+  return out
 }
 
 // ---------- public API ----------
@@ -554,20 +651,86 @@ async function* iterateResponseParts(response) {
 }
 
 // Drive the parser over a `ReadableStream<Uint8Array>` with a known boundary.
+// Reads source bytes only when the active part's body controller wants more,
+// propagating backpressure from consumer to source.
 async function* iterateStreamParts(stream, boundary) {
   const parser = new MultipartParser(boundary)
   const reader = stream.getReader()
+
+  const partQueue = []
+  let sourceDone = false
+  let sourceError = null
+  let pumpInflight = null
+
+  async function pumpOnce() {
+    try {
+      const { done, value } = await reader.read()
+      if (done) {
+        sourceDone = true
+        try {
+          parser.finish()
+        } catch (err) {
+          sourceError = err
+        }
+        return
+      }
+      if (value.length === 0) return
+      try {
+        for (const part of parser.write(value)) partQueue.push(part)
+      } catch (err) {
+        sourceError = err
+        sourceDone = true
+        parser._abortActive(err)
+      }
+    } catch (err) {
+      sourceError = err
+      sourceDone = true
+      parser._abortActive(err)
+    }
+  }
+
+  async function pumpUntil(predicate) {
+    while (!predicate()) {
+      if (pumpInflight) {
+        await pumpInflight
+        continue
+      }
+      pumpInflight = pumpOnce().finally(() => {
+        pumpInflight = null
+      })
+      await pumpInflight
+    }
+  }
+
+  parser._setPullHook((part) =>
+    pumpUntil(() =>
+      sourceDone || sourceError !== null || part._isClosed() || part._desiredSize() <= 0,
+    ),
+  )
+
   try {
     while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value.length === 0) continue
-      yield* parser.write(value)
+      if (partQueue.length > 0) {
+        yield partQueue.shift()
+        continue
+      }
+      if (sourceError) throw sourceError
+      if (sourceDone) return
+
+      // No part queued and source still running. If the caller iterated past
+      // an unread body, cancel it so subsequent bytes are dropped while we
+      // scan for the next boundary.
+      const active = parser._activePart
+      if (active) active._cancel()
+
+      await pumpUntil(() =>
+        partQueue.length > 0 || sourceDone || sourceError !== null,
+      )
     }
   } finally {
     reader.releaseLock()
+    parser._abortActive(new MultipartParseError('Iterator exited before stream ended'))
   }
-  parser.finish()
 }
 
 // ---------- prollyfill: Response.prototype.parts() ----------

@@ -74,6 +74,12 @@ async function collect(response: Response): Promise<BodyPart[]> {
   return parts
 }
 
+async function collectTexts(response: Response): Promise<string[]> {
+  const texts: string[] = []
+  for await (const part of response.parts()) texts.push(await part.text())
+  return texts
+}
+
 // ---------- getMultipartBoundary ----------
 
 Deno.test('getMultipartBoundary: extracts boundary', () => {
@@ -353,10 +359,8 @@ const boundaryBytes = bytes(`\r\n--${BOUNDARY}`)
 const splitIndex = indexOfBytes(sampleBody, boundaryBytes, 1)
 
 async function expectTwoPartsFromChunks(chunkSize: number) {
-  const parts = await collect(chunkedResponse(sampleBody, chunkSize))
-  assertEquals(parts.length, 2)
-  assertEquals(await parts[0].text(), 'value1')
-  assertEquals(await parts[1].text(), 'value2')
+  const texts = await collectTexts(chunkedResponse(sampleBody, chunkSize))
+  assertEquals(texts, ['value1', 'value2'])
 }
 
 Deno.test('parses correctly when boundary is split mid-pattern', () =>
@@ -374,12 +378,7 @@ Deno.test('parses correctly across many small chunks', async () => {
     { headers: ['Content-Type: text/plain'], body: 'two' },
     { headers: ['Content-Type: text/plain'], body: 'three' },
   ])
-  const parts = await collect(chunkedResponse(body, 1))
-
-  assertEquals(parts.length, 3)
-  assertEquals(await parts[0].text(), 'one')
-  assertEquals(await parts[1].text(), 'two')
-  assertEquals(await parts[2].text(), 'three')
+  assertEquals(await collectTexts(chunkedResponse(body, 1)), ['one', 'two', 'three'])
 })
 
 // ---------- errors ----------
@@ -522,9 +521,7 @@ Deno.test('Content-Length works when chunks split the body', async () => {
   const body = buildBody([
     { headers: ['Content-Length: 11'], body: 'hello world' },
   ])
-  const parts: BodyPart[] = []
-  for await (const part of chunkedResponse(body, 1).parts()) parts.push(part)
-  assertEquals(await parts[0].text(), 'hello world')
+  assertEquals(await collectTexts(chunkedResponse(body, 1)), ['hello world'])
 })
 
 Deno.test('Content-Length header name is case-insensitive', async () => {
@@ -558,10 +555,7 @@ Deno.test('ignores preamble split across chunks', async () => {
     `Content-Type: text/plain${CRLF}${CRLF}` +
     `payload${CRLF}` +
     `--${BOUNDARY}--`
-  const parts = await collect(chunkedResponse(bytes(raw), 8))
-
-  assertEquals(parts.length, 1)
-  assertEquals(await parts[0].text(), 'payload')
+  assertEquals(await collectTexts(chunkedResponse(bytes(raw), 8)), ['payload'])
 })
 
 Deno.test('ignores epilogue after the closing boundary', async () => {
@@ -585,10 +579,7 @@ Deno.test('ignores epilogue split across chunks', async () => {
     `payload${CRLF}` +
     `--${BOUNDARY}--${CRLF}` +
     `epilogue bytes that span more than one chunk boundary`
-  const parts = await collect(chunkedResponse(bytes(raw), 8))
-
-  assertEquals(parts.length, 1)
-  assertEquals(await parts[0].text(), 'payload')
+  assertEquals(await collectTexts(chunkedResponse(bytes(raw), 8)), ['payload'])
 })
 
 // ---------- nested multipart ----------
@@ -714,4 +705,257 @@ Deno.test('response.parts() iterates the parts of a multipart response', async (
   assertEquals(parts.length, 2)
   assertEquals(await parts[0].text(), 'one')
   assertEquals(await parts[1].text(), 'two')
+})
+
+// ---------- v2: streaming bodies ----------
+
+type ControllableResponse = {
+  response: Response
+  push: (chunk: Uint8Array) => void
+  close: () => void
+  error: (err: unknown) => void
+}
+
+function controllableResponse(): ControllableResponse {
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) { controller = c },
+  })
+  return {
+    response: new Response(stream, {
+      headers: { 'content-type': `multipart/mixed; boundary=${BOUNDARY}` },
+    }),
+    push: (chunk) => controller.enqueue(chunk),
+    close: () => controller.close(),
+    error: (err) => controller.error(err),
+  }
+}
+
+function pullCountedResponse(chunks: Uint8Array[]): {
+  response: Response
+  pulls: () => number
+} {
+  let i = 0
+  let pullCount = 0
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      pullCount++
+      if (i < chunks.length) controller.enqueue(chunks[i++])
+      else controller.close()
+    },
+  })
+  return {
+    response: new Response(stream, {
+      headers: { 'content-type': `multipart/mixed; boundary=${BOUNDARY}` },
+    }),
+    pulls: () => pullCount,
+  }
+}
+
+async function flushMicrotasks() {
+  for (let i = 0; i < 5; i++) await Promise.resolve()
+}
+
+Deno.test('yields BodyPart as soon as headers parse, before body bytes arrive', async () => {
+  const { response, push, close } = controllableResponse()
+
+  push(bytes(`--${BOUNDARY}${CRLF}Content-Type: text/plain${CRLF}${CRLF}`))
+
+  const iter = response.parts()[Symbol.asyncIterator]()
+  const result = await iter.next()
+  assertEquals(result.done, false)
+  assertEquals(result.value!.headers.get('content-type'), 'text/plain')
+
+  push(bytes(`hello${CRLF}--${BOUNDARY}--`))
+  close()
+
+  assertEquals(await result.value!.text(), 'hello')
+})
+
+Deno.test('body bytes land on the body stream as source chunks arrive', async () => {
+  const { response, push, close } = controllableResponse()
+
+  push(bytes(`--${BOUNDARY}${CRLF}Content-Type: text/plain${CRLF}${CRLF}`))
+  push(bytes('first '))
+
+  const iter = response.parts()[Symbol.asyncIterator]()
+  const { value: part } = await iter.next()
+  const reader = part!.body.getReader()
+
+  const r1 = await reader.read()
+  assertEquals(new TextDecoder().decode(r1.value), 'first ')
+
+  push(bytes('second'))
+  const r2 = await reader.read()
+  assertEquals(new TextDecoder().decode(r2.value), 'second')
+
+  push(bytes(`${CRLF}--${BOUNDARY}--`))
+  close()
+  const r3 = await reader.read()
+  assertEquals(r3.done, true)
+})
+
+Deno.test('iterating past an unread body auto-drains it', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'skip-me' },
+    { headers: ['Content-Type: text/plain'], body: 'keep-me' },
+  ])
+  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+
+  const first = await iter.next()
+  assertEquals(first.done, false)
+  // Do not read first.value!.body or call text().
+
+  const second = await iter.next()
+  assertEquals(second.done, false)
+  assertEquals(await second.value!.text(), 'keep-me')
+})
+
+Deno.test('body.cancel() releases and the iterator advances to the next part', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'first' },
+    { headers: ['Content-Type: text/plain'], body: 'second' },
+  ])
+  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+
+  const { value: first } = await iter.next()
+  await first!.body.cancel()
+
+  const { value: second } = await iter.next()
+  assertEquals(await second!.text(), 'second')
+})
+
+Deno.test('source errors propagate to the active body stream', async () => {
+  const { response, push, error } = controllableResponse()
+
+  push(bytes(`--${BOUNDARY}${CRLF}Content-Type: text/plain${CRLF}${CRLF}hello`))
+
+  const iter = response.parts()[Symbol.asyncIterator]()
+  const { value: part } = await iter.next()
+  const reader = part!.body.getReader()
+
+  const r1 = await reader.read()
+  assertEquals(new TextDecoder().decode(r1.value), 'hello')
+
+  const sourceErr = new Error('network blew up')
+  error(sourceErr)
+
+  let caught: unknown = null
+  try {
+    await reader.read()
+  } catch (e) {
+    caught = e
+  }
+  assertEquals(caught, sourceErr)
+})
+
+Deno.test('missing closing boundary errors the active body and the iterator', async () => {
+  const { response, push, close } = controllableResponse()
+
+  push(bytes(`--${BOUNDARY}${CRLF}Content-Type: text/plain${CRLF}${CRLF}partial`))
+  close()
+
+  const iter = response.parts()[Symbol.asyncIterator]()
+  const { value: part } = await iter.next()
+  const reader = part!.body.getReader()
+
+  const r1 = await reader.read()
+  assertEquals(new TextDecoder().decode(r1.value), 'partial')
+
+  let bodyErr: unknown = null
+  try {
+    await reader.read()
+  } catch (e) {
+    bodyErr = e
+  }
+  assertEquals(bodyErr instanceof MultipartParseError, true)
+
+  let iterErr: unknown = null
+  try {
+    await iter.next()
+  } catch (e) {
+    iterErr = e
+  }
+  assertEquals(iterErr instanceof MultipartParseError, true)
+})
+
+Deno.test('backpressure: source not pulled while consumer ignores body', async () => {
+  const headers = `--${BOUNDARY}${CRLF}Content-Type: text/plain${CRLF}${CRLF}`
+  const tail = `${CRLF}--${BOUNDARY}--`
+  const chunks = [
+    bytes(headers + 'aaaa'),
+    bytes('bbbb'),
+    bytes('cccc'),
+    bytes('dddd'),
+    bytes('eeee'),
+    bytes(tail),
+  ]
+  const { response, pulls } = pullCountedResponse(chunks)
+  const iter = response.parts()[Symbol.asyncIterator]()
+
+  const { value: part } = await iter.next()
+  assertEquals(part!.headers.get('content-type'), 'text/plain')
+
+  await flushMicrotasks()
+  const settled = pulls()
+  if (settled > 3) {
+    throw new Error(`expected <= 3 pulls while body ignored, got ${settled}`)
+  }
+
+  assertEquals(await part!.text(), 'aaaabbbbccccddddeeee')
+  const { done } = await iter.next()
+  assertEquals(done, true)
+})
+
+Deno.test('large body streams without buffering all chunks', async () => {
+  const chunkSize = 1024
+  const numChunks = 100
+  const headers = `--${BOUNDARY}${CRLF}Content-Type: application/octet-stream${CRLF}${CRLF}`
+
+  const chunks: Uint8Array[] = [bytes(headers)]
+  for (let i = 0; i < numChunks; i++) {
+    chunks.push(new Uint8Array(chunkSize).fill(i % 256))
+  }
+  chunks.push(bytes(`${CRLF}--${BOUNDARY}--`))
+
+  const { response } = pullCountedResponse(chunks)
+  const iter = response.parts()[Symbol.asyncIterator]()
+  const { value: part } = await iter.next()
+
+  const reader = part!.body.getReader()
+  let total = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.length
+  }
+  assertEquals(total, chunkSize * numChunks)
+})
+
+Deno.test('bodyUsed stays false when body is abandoned', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'first' },
+    { headers: ['Content-Type: text/plain'], body: 'second' },
+  ])
+  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+
+  const { value: first } = await iter.next()
+  assertEquals(first!.bodyUsed, false)
+
+  await iter.next()
+  // Even after auto-drain, the caller never accessed first's body.
+  assertEquals(first!.bodyUsed, false)
+})
+
+Deno.test('bodyUsed flips after body.cancel()', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'hi' },
+    { headers: ['Content-Type: text/plain'], body: 'bye' },
+  ])
+  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+
+  const { value: first } = await iter.next()
+  assertEquals(first!.bodyUsed, false)
+  await first!.body.cancel()
+  assertEquals(first!.bodyUsed, true)
 })

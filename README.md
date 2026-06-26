@@ -144,23 +144,32 @@ for await (const part of response.parts()) {
 
 ### Drive the parser by hand
 
-For non-stream sources, feed bytes directly:
+For non-stream sources, feed bytes directly. `parser.write(chunk)` yields each `BodyPart` as soon as its headers parse, then routes body bytes into that part's stream as later `write()` calls arrive. Closes the body stream when it reaches the next boundary.
+
+Collect the parts during writes; read their bodies after `finish()`:
 
 ```js
 import { MultipartParser } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
 const parser = new MultipartParser(boundary)
+const parts = []
 for (const chunk of chunks) {
-  for (const part of parser.write(chunk)) {
-    await part.text()
-  }
+  for (const part of parser.write(chunk)) parts.push(part)
 }
 parser.finish()
+
+for (const part of parts) {
+  console.log(await part.text())
+}
 ```
 
 ## Behavior
 
-Each part's body is buffered in memory before the part is yielded. Suitable for small parts (hypermedia fragments, form fields, header-style messages). For large or open-ended parts, see [`ROADMAP.md`](./ROADMAP.md).
+Each part is yielded as soon as its headers parse. `part.body` is a live `ReadableStream<Uint8Array>` that receives bytes as the parser sees them. Suitable for large files, open-ended streams (`multipart/x-mixed-replace`, MJPEG, server-push), and anything else that should not buffer in memory.
+
+Consume each part's body (`text()`, `bytes()`, `body.getReader()`, etc.) or cancel it (`body.cancel()`) before advancing to the next part. Iterating past an unread body auto-drains it: remaining bytes are discarded until the next boundary.
+
+Backpressure flows from the consumer through the part's body stream to the underlying response stream. Slow readers do not buffer arbitrary bytes in memory.
 
 ## Credits
 
