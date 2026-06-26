@@ -1,3 +1,4 @@
+// @ts-self-types="./fetch-multipart.d.ts"
 // Streaming multipart parser for the browser.
 //
 // Public API:

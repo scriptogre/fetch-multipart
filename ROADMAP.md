@@ -7,10 +7,6 @@
 - **Streaming bodies.** Yield each `BodyPart` as soon as its headers are parsed. `body` is a live `ReadableStream<Uint8Array>` that receives bytes as they arrive. Required for browser-grade memory behavior on large or open-ended parts. Imposes "consume each part before the next" on callers.
 
 
-## Tooling
-
-- Ship a `.d.ts` alongside `fetch-multipart.js`.
-
 ## Out of scope
 
 - Caller-set safety limits (`maxParts`, `maxPartSize`). Future browser implementations enforce internal limits, not JS-tunable ones.

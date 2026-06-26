@@ -8,13 +8,6 @@ import {
   parseContentDisposition,
 } from '../fetch-multipart.js'
 
-// Type augmentation for the Response.prototype.parts prollyfill.
-declare global {
-  interface Response {
-    parts(): AsyncIterable<BodyPart>
-  }
-}
-
 // ---------- helpers ----------
 
 const CRLF = '\r\n'
