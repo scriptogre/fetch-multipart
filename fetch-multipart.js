@@ -301,7 +301,8 @@ function concatChunks(chunks) {
  */
 export class BodyPart {
   /** @type {Uint8Array[]} */ #content
-  /** @type {Headers} */ #headers
+  /** @type {Uint8Array} */ #headerBytes
+  /** @type {Headers | null} */ #headers = null
   /** @type {ReadableStream<Uint8Array> | null} */ #body = null
   #bodyUsed = false
 
@@ -310,12 +311,13 @@ export class BodyPart {
    * @param {Uint8Array[]} contentChunks
    */
   constructor(headerBytes, contentChunks) {
+    this.#headerBytes = headerBytes
     this.#content = contentChunks
-    this.#headers = parseHeaderBytes(headerBytes)
   }
 
   /** @returns {Headers} */
   get headers() {
+    if (this.#headers === null) this.#headers = parseHeaderBytes(this.#headerBytes)
     return this.#headers
   }
 
@@ -367,7 +369,7 @@ export class BodyPart {
   async blob() {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
-    const type = this.#headers.get('content-type') ?? ''
+    const type = this.headers.get('content-type') ?? ''
     return new Blob([concatChunks(this.#content)], { type })
   }
 }
