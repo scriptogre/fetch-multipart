@@ -18,46 +18,101 @@ Streaming `multipart/*` parser for the browser. One file. No dependencies.
 
 Parses any `multipart/*` HTTP response into an async iterable of `BodyPart` objects. Works on long-lived streaming responses (`multipart/mixed`, `multipart/x-mixed-replace`) and one-shot bodies (`multipart/form-data`, `multipart/byteranges`, etc.).
 
-## API
+## Usage
 
-### `parseMultipart(response): AsyncIterable<BodyPart>`
+### Parse a multipart response
 
-Reads the `Content-Type` header for the boundary, then yields each part as it arrives.
+```js
+import { parseMultipart } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
-### `parseMultipartStream(stream, boundary): AsyncIterable<BodyPart>`
+const response = await fetch('/stream')
 
-Lower-level: parse any `ReadableStream<Uint8Array>` given an explicit boundary.
-
-### `getMultipartBoundary(contentType): string | null`
-
-Extract the `boundary` parameter from a `Content-Type` header value.
-
-### `class BodyPart implements Body`
-
-Each part exposes the same `Body` interface as `Response` and `Request`:
-
-```ts
-class BodyPart {
-  readonly headers: Headers
-  readonly body: ReadableStream<Uint8Array>
-  readonly bodyUsed: boolean
-  arrayBuffer(): Promise<ArrayBuffer>
-  bytes(): Promise<Uint8Array>
-  text(): Promise<string>
-  json(): Promise<any>
-  blob(): Promise<Blob>
+for await (const part of parseMultipart(response)) {
+  part.headers.get('content-type')   // 'application/json'
+  await part.json()                  // { ... }
 }
 ```
 
-A `BodyPart` is the MIME entity from RFC 2046 §5.1: a `Headers` object and a body stream. No status code, no URL.
+Or use the prollyfill (auto-installed on import):
 
-### `class MultipartParser`
+```js
+import 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
-Low-level state machine that yields `BodyPart` objects from raw `Uint8Array` chunks. Use when you need to drive the parser manually.
+const response = await fetch('/stream')
+for await (const part of response.multipart()) {
+  await part.text()
+}
+```
 
-### `class MultipartParseError extends Error`
+### Read parts as different types
 
-Thrown for malformed multipart streams.
+Each part implements the same [`Body`](https://developer.mozilla.org/en-US/docs/Web/API/Body) interface as `Response` and `Request`:
+
+```js
+for await (const part of response.multipart()) {
+  await part.text()         // string
+  await part.json()         // any
+  await part.bytes()        // Uint8Array
+  await part.arrayBuffer()  // ArrayBuffer
+  await part.blob()         // Blob (typed by part's Content-Type)
+  part.body                 // ReadableStream<Uint8Array>
+  part.bodyUsed             // boolean
+}
+```
+
+A `BodyPart` is the MIME entity from [RFC 2046 §5.1](https://www.rfc-editor.org/rfc/rfc2046#section-5.1): headers and a body. No status code, no URL.
+
+### Parse a raw byte stream
+
+When you already have a `ReadableStream<Uint8Array>` and the boundary string:
+
+```js
+import { parseMultipartStream } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+for await (const part of parseMultipartStream(stream, boundary)) {
+  await part.text()
+}
+```
+
+### Extract the boundary from a Content-Type header
+
+```js
+import { getMultipartBoundary } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+getMultipartBoundary('multipart/mixed; boundary=abc')   // 'abc'
+getMultipartBoundary('text/plain')                      // null
+```
+
+### Drive the parser by hand
+
+For non-stream sources, feed bytes directly:
+
+```js
+import { MultipartParser } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+const parser = new MultipartParser(boundary)
+for (const chunk of chunks) {
+  for (const part of parser.write(chunk)) {
+    await part.text()
+  }
+}
+parser.finish()
+```
+
+### Handle errors
+
+Errors are `MultipartParseError`, which extends `TypeError` (matching the [WHATWG Fetch convention](https://fetch.spec.whatwg.org/#dom-body-formdata) for `Body` method errors):
+
+```js
+import { MultipartParseError } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+try {
+  for await (const part of response.multipart()) { /* ... */ }
+} catch (err) {
+  err instanceof TypeError              // true
+  err instanceof MultipartParseError    // true
+}
+```
 
 ## Behavior
 
