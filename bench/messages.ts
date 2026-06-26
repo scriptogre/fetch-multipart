@@ -113,3 +113,55 @@ export const fiveLargeFilesAdversarial = new MultipartMessage(boundary, [
   createAdversarialBytes(20 * oneMb, boundary),
   createAdversarialBytes(50 * oneMb, boundary),
 ])
+
+// ---------- HTML fragment scenarios ----------
+//
+// Realistic shape for hypermedia server-push: many small parts whose bodies
+// are HTML text. No '\r' bytes appear inside body content (LF line breaks
+// only). This is the workload where memchr-style searches potentially shine.
+
+const HTML_TEMPLATE = `<div class="message" id="msg-__N__">
+  <header class="msg-header">
+    <span class="user">user__N__@example.com</span>
+    <time datetime="2026-06-26T12:34:56Z">just now</time>
+  </header>
+  <div class="msg-body">
+    <p>This is hypermedia fragment __N__ with some readable text content.</p>
+    <p>Server-pushed HTML over a long-lived multipart/mixed stream.</p>
+  </div>
+</div>`
+
+function makeHtmlFragment(index: number, targetSize: number): Uint8Array {
+  let text = HTML_TEMPLATE.replaceAll('__N__', String(index))
+  while (text.length < targetSize) {
+    text += `\n<p>Filler line ${text.length} to reach target size.</p>`
+  }
+  return new TextEncoder().encode(text.slice(0, targetSize))
+}
+
+function makeHtmlFragments(count: number, sizeFn: (i: number) => number): Uint8Array[] {
+  return Array.from({ length: count }, (_, i) => makeHtmlFragment(i, sizeFn(i)))
+}
+
+// 1000 tiny HTML fragments (~200 B each), like a chatty real-time feed.
+export const manyTinyHtmlFragments = new MultipartMessage(
+  boundary,
+  makeHtmlFragments(1000, () => 200),
+)
+
+// 100 typical fragments (~1 KiB each), like a moderate hypermedia stream.
+export const typicalHtmlBurst = new MultipartMessage(
+  boundary,
+  makeHtmlFragments(100, () => oneKb),
+)
+
+// 50 mixed-size fragments (200 B - 5 KiB), more realistic distribution.
+export const realisticHtmlBurst = new MultipartMessage(
+  boundary,
+  makeHtmlFragments(50, (i) => 200 + ((i * 97) % (5 * oneKb))),
+)
+
+// One large HTML page (100 KiB), like a server-rendered initial response.
+export const oneLargeHtmlPage = new MultipartMessage(boundary, [
+  makeHtmlFragment(0, 100 * oneKb),
+])

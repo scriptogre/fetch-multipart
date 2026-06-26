@@ -8,11 +8,15 @@
 import {
   fiveLargeFiles,
   fiveLargeFilesAdversarial,
+  manyTinyHtmlFragments,
   MultipartMessage,
   oneHundredSmallFiles,
   oneLargeFile,
   oneLargeFileAdversarial,
+  oneLargeHtmlPage,
   oneSmallFile,
+  realisticHtmlBurst,
+  typicalHtmlBurst,
 } from './messages.ts'
 
 import { parseMultipartStream as oursParseStream } from '../fetch-multipart.js'
@@ -31,6 +35,10 @@ const scenarios: Scenario[] = [
   { id: '5-large-files', name: '5 large files', message: fiveLargeFiles },
   { id: '1-large-adversarial', name: '1 large file (adversarial)', message: oneLargeFileAdversarial },
   { id: '5-large-adversarial', name: '5 large files (adversarial)', message: fiveLargeFilesAdversarial },
+  { id: 'many-tiny-html', name: '1000 tiny HTML parts', message: manyTinyHtmlFragments },
+  { id: 'typical-html', name: '100 typical HTML parts', message: typicalHtmlBurst },
+  { id: 'realistic-html', name: '50 mixed HTML parts', message: realisticHtmlBurst },
+  { id: '1-large-html', name: '1 large HTML page', message: oneLargeHtmlPage },
 ]
 
 interface Parser {
