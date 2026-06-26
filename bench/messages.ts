@@ -24,12 +24,20 @@ function getRandomBytes(size: number): Uint8Array {
 
 const NodeDefaultHighWaterMark = 65536
 
+export interface MultipartMessageOptions {
+  withContentLength?: boolean
+}
+
 export class MultipartMessage {
   boundary: string
   content: Uint8Array
   #chunkCache = new Map<number, Uint8Array[]>()
 
-  constructor(boundary: string, partSizesOrContents: number[] | Uint8Array[]) {
+  constructor(
+    boundary: string,
+    partSizesOrContents: number[] | Uint8Array[],
+    options: MultipartMessageOptions = {},
+  ) {
     this.boundary = boundary
 
     const chunks: Uint8Array[] = []
@@ -45,6 +53,9 @@ export class MultipartMessage {
       pushLine(`--${boundary}`)
       pushLine(`Content-Disposition: form-data; name="file${i}"; filename="file${i}.dat"`)
       pushLine('Content-Type: application/octet-stream')
+      if (options.withContentLength) {
+        pushLine(`Content-Length: ${partContents[i].length}`)
+      }
       pushLine()
       chunks.push(partContents[i])
       pushLine()
@@ -165,3 +176,29 @@ export const realisticHtmlBurst = new MultipartMessage(
 export const oneLargeHtmlPage = new MultipartMessage(boundary, [
   makeHtmlFragment(0, 100 * oneKb),
 ])
+
+// ---------- Content-Length variants ----------
+//
+// Same payloads as above but with a Content-Length header on each part. Lets
+// the parser take the fast-path read instead of scanning for the boundary.
+
+export const oneHundredSmallFilesWithContentLength = new MultipartMessage(
+  boundary,
+  Array(100).fill(oneKb),
+  { withContentLength: true },
+)
+export const oneLargeFileWithContentLength = new MultipartMessage(
+  boundary,
+  [10 * oneMb],
+  { withContentLength: true },
+)
+export const manyTinyHtmlFragmentsWithContentLength = new MultipartMessage(
+  boundary,
+  makeHtmlFragments(1000, () => 200),
+  { withContentLength: true },
+)
+export const typicalHtmlBurstWithContentLength = new MultipartMessage(
+  boundary,
+  makeHtmlFragments(100, () => oneKb),
+  { withContentLength: true },
+)

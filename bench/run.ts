@@ -9,14 +9,18 @@ import {
   fiveLargeFiles,
   fiveLargeFilesAdversarial,
   manyTinyHtmlFragments,
+  manyTinyHtmlFragmentsWithContentLength,
   MultipartMessage,
   oneHundredSmallFiles,
+  oneHundredSmallFilesWithContentLength,
   oneLargeFile,
   oneLargeFileAdversarial,
+  oneLargeFileWithContentLength,
   oneLargeHtmlPage,
   oneSmallFile,
   realisticHtmlBurst,
   typicalHtmlBurst,
+  typicalHtmlBurstWithContentLength,
 } from './messages.ts'
 
 import { parseMultipartStream as oursParseStream } from '../fetch-multipart.js'
@@ -31,12 +35,16 @@ interface Scenario {
 const scenarios: Scenario[] = [
   { id: '1-small-file', name: '1 small file', message: oneSmallFile },
   { id: '1-large-file', name: '1 large file', message: oneLargeFile },
+  { id: '1-large-file-with-content-length', name: '1 large file (with Content-Length)', message: oneLargeFileWithContentLength },
   { id: '100-small-files', name: '100 small files', message: oneHundredSmallFiles },
+  { id: '100-small-files-with-content-length', name: '100 small files (with Content-Length)', message: oneHundredSmallFilesWithContentLength },
   { id: '5-large-files', name: '5 large files', message: fiveLargeFiles },
   { id: '1-large-adversarial', name: '1 large file (adversarial)', message: oneLargeFileAdversarial },
   { id: '5-large-adversarial', name: '5 large files (adversarial)', message: fiveLargeFilesAdversarial },
   { id: 'many-tiny-html', name: '1000 tiny HTML parts', message: manyTinyHtmlFragments },
+  { id: 'many-tiny-html-with-content-length', name: '1000 tiny HTML parts (with Content-Length)', message: manyTinyHtmlFragmentsWithContentLength },
   { id: 'typical-html', name: '100 typical HTML parts', message: typicalHtmlBurst },
+  { id: 'typical-html-with-content-length', name: '100 typical HTML parts (with Content-Length)', message: typicalHtmlBurstWithContentLength },
   { id: 'realistic-html', name: '50 mixed HTML parts', message: realisticHtmlBurst },
   { id: '1-large-html', name: '1 large HTML page', message: oneLargeHtmlPage },
 ]
