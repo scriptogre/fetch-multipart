@@ -11,7 +11,10 @@
 // Parser engine ported from @remix-run/multipart-parser (MIT, Shopify Inc).
 // https://github.com/remix-run/remix/tree/main/packages/multipart-parser
 
-export class MultipartParseError extends Error {
+/**
+ * Thrown when a multipart stream cannot be parsed.
+ */
+export class MultipartParseError extends TypeError {
   constructor(message) {
     super(message)
     this.name = 'MultipartParseError'
@@ -20,15 +23,11 @@ export class MultipartParseError extends Error {
 
 // ---------- byte search ----------
 
-function encodeAsciiPattern(pattern) {
-  const bytes = new Uint8Array(pattern.length)
-  for (let i = 0; i < pattern.length; ++i) bytes[i] = pattern.charCodeAt(i) & 0xff
-  return bytes
-}
+const utf8Encoder = new TextEncoder()
 
 // Boyer-Moore-Horspool over a Uint8Array.
 function createSearch(pattern) {
-  const needle = encodeAsciiPattern(pattern)
+  const needle = utf8Encoder.encode(pattern)
   const needleEnd = needle.length - 1
   const skipTable = new Uint8Array(256).fill(needle.length)
   for (let i = 0; i < needleEnd; ++i) skipTable[needle[i]] = needleEnd - i
@@ -49,7 +48,7 @@ function createSearch(pattern) {
 // Finds a partial occurrence of `pattern` whose suffix touches the end of the
 // haystack. Used to detect a boundary that may be split across two chunks.
 function createPartialTailSearch(pattern) {
-  const needle = encodeAsciiPattern(pattern)
+  const needle = utf8Encoder.encode(pattern)
   const byteIndexes = Object.create(null)
   for (let i = 0; i < needle.length; ++i) {
     const byte = needle[i]
@@ -95,6 +94,16 @@ export class MultipartParser {
   #currentContent = null
 
   constructor(boundary) {
+    // RFC 2046 §5.1.1 limits the boundary to 1-70 ASCII characters from a
+    // small subset. Real-world implementations stick to printable ASCII; we
+    // enforce that broader range so non-ASCII boundaries fail loudly instead
+    // of silently misaligning the parser's char-length arithmetic.
+    if (!/^[\x20-\x7E]{1,70}$/.test(boundary)) {
+      throw new MultipartParseError(
+        'Invalid boundary: must be 1-70 printable ASCII characters',
+      )
+    }
+
     this.boundary = boundary
     this.#findOpeningBoundary = createSearch(`--${boundary}`)
     this.#openingBoundaryLength = 2 + boundary.length
@@ -102,12 +111,12 @@ export class MultipartParser {
     this.#findBoundary = createSearch(boundaryPattern)
     this.#findPartialTailBoundary = createPartialTailSearch(boundaryPattern)
     this.#boundaryLength = 4 + boundary.length
-    this.#boundaryBytes = encodeAsciiPattern(boundaryPattern)
+    this.#boundaryBytes = utf8Encoder.encode(boundaryPattern)
   }
 
   *write(chunk) {
     if (this.#state === STATE_DONE) {
-      throw new MultipartParseError('Unexpected data after end of stream')
+      throw new MultipartParseError('Unexpected data after final boundary')
     }
 
     let index = 0
@@ -209,7 +218,7 @@ export class MultipartParser {
           break
         }
         if (this.#findOpeningBoundary(chunk) !== 0) {
-          throw new MultipartParseError('Invalid multipart stream: missing initial boundary')
+          throw new MultipartParseError('Missing initial boundary')
         }
         index = this.#openingBoundaryLength
         this.#state = STATE_AFTER_BOUNDARY
@@ -219,7 +228,7 @@ export class MultipartParser {
 
   finish() {
     if (this.#state !== STATE_DONE) {
-      throw new MultipartParseError('Multipart stream not finished')
+      throw new MultipartParseError('Stream ended before final boundary')
     }
   }
 
@@ -383,14 +392,14 @@ export function getMultipartBoundary(contentType) {
 export async function* parseMultipart(response) {
   const contentType = response.headers.get('content-type')
   if (!contentType || !contentType.toLowerCase().startsWith('multipart/')) {
-    throw new MultipartParseError('Response is not multipart/*')
+    throw new MultipartParseError('Content-Type is not multipart/*')
   }
   if (!response.body) {
-    throw new MultipartParseError('Response body is empty')
+    throw new MultipartParseError('Response body is null')
   }
   const boundary = getMultipartBoundary(contentType)
   if (!boundary) {
-    throw new MultipartParseError('Missing boundary in Content-Type')
+    throw new MultipartParseError('Content-Type has no boundary parameter')
   }
   yield* parseMultipartStream(response.body, boundary)
 }
@@ -416,4 +425,20 @@ export async function* parseMultipartStream(stream, boundary) {
     reader.releaseLock()
   }
   parser.finish()
+}
+
+// ---------- prollyfill: Response.prototype.multipart() ----------
+//
+// Speculative install of a `multipart()` method on Response. Mirrors the shape
+// of `Response.prototype.formData()`. Conditional so a future native version
+// wins automatically.
+
+if (typeof Response !== 'undefined' && typeof Response.prototype.multipart !== 'function') {
+  Object.defineProperty(Response.prototype, 'multipart', {
+    value: function multipart() {
+      return parseMultipart(this)
+    },
+    writable: true,
+    configurable: true,
+  })
 }

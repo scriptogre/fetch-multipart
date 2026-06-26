@@ -3,10 +3,18 @@ import { assertEquals, assertRejects } from 'jsr:@std/assert'
 import {
   BodyPart,
   MultipartParseError,
+  MultipartParser,
   getMultipartBoundary,
   parseMultipart,
   parseMultipartStream,
 } from '../fetch-multipart.js'
+
+// Type augmentation for the Response.prototype.multipart prollyfill.
+declare global {
+  interface Response {
+    multipart(): AsyncIterable<BodyPart>
+  }
+}
 
 // ---------- helpers ----------
 
@@ -325,7 +333,71 @@ Deno.test('throws when final closing boundary is missing', async () => {
   }, MultipartParseError)
 })
 
+Deno.test('MultipartParseError is a TypeError', () => {
+  const err = new MultipartParseError('test')
+  assertEquals(err instanceof TypeError, true)
+  assertEquals(err instanceof MultipartParseError, true)
+  assertEquals(err.name, 'MultipartParseError')
+})
+
+// ---------- boundary validation ----------
+
+Deno.test('rejects empty boundary', () => {
+  assertThrowsConstructor('')
+})
+
+Deno.test('rejects boundary longer than 70 characters', () => {
+  assertThrowsConstructor('a'.repeat(71))
+})
+
+Deno.test('rejects non-ASCII boundary', () => {
+  assertThrowsConstructor('café')
+})
+
+Deno.test('rejects boundary with control characters', () => {
+  assertThrowsConstructor('abc\x01def')
+})
+
+Deno.test('accepts a 70-character ASCII boundary', () => {
+  new MultipartParser('a'.repeat(70))
+})
+
+Deno.test('accepts boundary with the full printable ASCII range', () => {
+  new MultipartParser(`abc-XYZ_0123 +'(),/:=?.!*~@#$%^&{}|`)
+})
+
+function assertThrowsConstructor(boundary: string) {
+  let threw = false
+  try {
+    new MultipartParser(boundary)
+  } catch (err) {
+    threw = true
+    assertEquals(err instanceof MultipartParseError, true)
+  }
+  assertEquals(threw, true)
+}
+
 // ---------- parseMultipartStream ----------
+
+// ---------- Response.prototype.multipart prollyfill ----------
+
+Deno.test('installs Response.prototype.multipart', () => {
+  assertEquals(typeof Response.prototype.multipart, 'function')
+})
+
+Deno.test('response.multipart() yields the same parts as parseMultipart(response)', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'one' },
+    { headers: ['Content-Type: text/plain'], body: 'two' },
+  ])
+
+  const parts: BodyPart[] = []
+  for await (const part of singleChunkResponse(body).multipart()) parts.push(part)
+
+  assertEquals(parts.length, 2)
+  assertEquals(await parts[0].text(), 'one')
+  assertEquals(await parts[1].text(), 'two')
+})
 
 Deno.test('parseMultipartStream parses with explicit boundary', async () => {
   const body = buildBody([{ headers: ['Content-Type: text/plain'], body: 'streamed' }])
