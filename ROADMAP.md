@@ -6,13 +6,9 @@
 
 - **Streaming bodies.** Yield each `BodyPart` as soon as its headers are parsed. `body` is a live `ReadableStream<Uint8Array>` that receives bytes as they arrive. Required for browser-grade memory behavior on large or open-ended parts. Imposes "consume each part before the next" on callers.
 
-## Spec compliance
-
-- Tolerate lone `\n` line endings in addition to `\r\n`.
 
 ## Ergonomics
 
-- Document `AbortController` usage for cancelling long-lived streams. Add a test.
 - Document nested multipart with a short recipe (a part whose `Content-Type` is `multipart/*` can be fed back through `parseMultipartStream`).
 
 ## Tooling

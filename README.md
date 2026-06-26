@@ -114,6 +114,25 @@ try {
 }
 ```
 
+### Cancel a long-lived stream
+
+Pass an `AbortSignal` to `fetch`. When you call `controller.abort()`, the response body stream errors and the iterator throws a `DOMException` with `name === 'AbortError'`.
+
+```js
+const controller = new AbortController()
+const response = await fetch('/stream', { signal: controller.signal })
+
+setTimeout(() => controller.abort(), 5000)
+
+try {
+  for await (const part of response.parts()) {
+    console.log(await part.text())
+  }
+} catch (err) {
+  if (err.name !== 'AbortError') throw err
+}
+```
+
 ## Behavior
 
 Each part's body is buffered in memory before the part is yielded. Suitable for small parts (hypermedia fragments, form fields, header-style messages). For large or open-ended parts, see [`ROADMAP.md`](./ROADMAP.md).

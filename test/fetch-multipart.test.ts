@@ -600,6 +600,47 @@ Deno.test('ignores epilogue split across chunks', async () => {
   assertEquals(await parts[0].text(), 'payload')
 })
 
+// ---------- AbortController cancellation ----------
+
+Deno.test('AbortSignal cancels mid-stream and propagates the abort error', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain'], body: 'one' },
+    { headers: ['Content-Type: text/plain'], body: 'two' },
+  ])
+
+  const controller = new AbortController()
+  const stream = new ReadableStream<Uint8Array>({
+    async start(ctrl) {
+      controller.signal.addEventListener('abort', () => {
+        ctrl.error(new DOMException('Aborted', 'AbortError'))
+      })
+      // Emit one byte at a time with a yield so the consumer can abort.
+      for (let i = 0; i < body.length; i++) {
+        if (controller.signal.aborted) return
+        ctrl.enqueue(body.subarray(i, i + 1))
+        await new Promise((resolve) => setTimeout(resolve, 0))
+      }
+      ctrl.close()
+    },
+  })
+
+  let parts = 0
+  let error: unknown = null
+  try {
+    for await (const part of parseMultipartStream(stream, BOUNDARY)) {
+      parts++
+      await part.text()
+      if (parts === 1) controller.abort()
+    }
+  } catch (err) {
+    error = err
+  }
+
+  assertEquals(parts, 1)
+  assertEquals(error instanceof DOMException, true)
+  assertEquals((error as DOMException).name, 'AbortError')
+})
+
 // ---------- parseMultipartStream ----------
 
 // ---------- Response.prototype.parts prollyfill ----------
