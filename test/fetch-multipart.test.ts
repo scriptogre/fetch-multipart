@@ -5,6 +5,7 @@ import {
   MultipartParseError,
   MultipartParser,
   getMultipartBoundary,
+  parseContentDisposition,
   parseMultipart,
   parseMultipartStream,
 } from '../fetch-multipart.js'
@@ -110,6 +111,94 @@ Deno.test('getMultipartBoundary: tolerates whitespace around the equals sign', (
 
 Deno.test('getMultipartBoundary: preserves whitespace inside the quoted form', () => {
   assertEquals(getMultipartBoundary('multipart/mixed; boundary=" abc "'), ' abc ')
+})
+
+// ---------- parseContentDisposition ----------
+
+Deno.test('parseContentDisposition: form-data with name', () => {
+  assertEquals(
+    parseContentDisposition('form-data; name="email"'),
+    { type: 'form-data', name: 'email', filename: null },
+  )
+})
+
+Deno.test('parseContentDisposition: form-data with name and filename', () => {
+  assertEquals(
+    parseContentDisposition('form-data; name="file"; filename="resume.pdf"'),
+    { type: 'form-data', name: 'file', filename: 'resume.pdf' },
+  )
+})
+
+Deno.test('parseContentDisposition: attachment with filename', () => {
+  assertEquals(
+    parseContentDisposition('attachment; filename="cat.jpg"'),
+    { type: 'attachment', name: null, filename: 'cat.jpg' },
+  )
+})
+
+Deno.test('parseContentDisposition: type-only header (inline)', () => {
+  assertEquals(
+    parseContentDisposition('inline'),
+    { type: 'inline', name: null, filename: null },
+  )
+})
+
+Deno.test('parseContentDisposition: unquoted parameter values', () => {
+  assertEquals(
+    parseContentDisposition('form-data; name=email'),
+    { type: 'form-data', name: 'email', filename: null },
+  )
+})
+
+Deno.test('parseContentDisposition: case-insensitive parameter names', () => {
+  assertEquals(
+    parseContentDisposition('form-data; Name="email"; Filename="file.txt"'),
+    { type: 'form-data', name: 'email', filename: 'file.txt' },
+  )
+})
+
+Deno.test('parseContentDisposition: type is lowercased', () => {
+  assertEquals(
+    parseContentDisposition('FORM-DATA; name="email"'),
+    { type: 'form-data', name: 'email', filename: null },
+  )
+})
+
+Deno.test('parseContentDisposition: filename* (RFC 5987) wins over filename', () => {
+  assertEquals(
+    parseContentDisposition(
+      `form-data; name="file"; filename="cafe.txt"; filename*=UTF-8''caf%C3%A9.txt`,
+    ),
+    { type: 'form-data', name: 'file', filename: 'café.txt' },
+  )
+})
+
+Deno.test('parseContentDisposition: filename* alone (non-ASCII filename)', () => {
+  assertEquals(
+    parseContentDisposition(`attachment; filename*=UTF-8''%E2%98%83.txt`),
+    { type: 'attachment', name: null, filename: '☃.txt' },
+  )
+})
+
+Deno.test('parseContentDisposition: tolerates semicolon inside quoted value', () => {
+  assertEquals(
+    parseContentDisposition('form-data; name="a;b"; filename="c;d.txt"'),
+    { type: 'form-data', name: 'a;b', filename: 'c;d.txt' },
+  )
+})
+
+Deno.test('parseContentDisposition: null header returns all nulls', () => {
+  assertEquals(
+    parseContentDisposition(null),
+    { type: null, name: null, filename: null },
+  )
+})
+
+Deno.test('parseContentDisposition: empty header returns all nulls', () => {
+  assertEquals(
+    parseContentDisposition(''),
+    { type: null, name: null, filename: null },
+  )
 })
 
 // ---------- parseMultipart: happy paths ----------

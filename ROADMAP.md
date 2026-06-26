@@ -12,7 +12,6 @@
 
 ## Ergonomics
 
-- `parseContentDisposition(header)` returns `{ name, filename }`. Handles quoted values and RFC 5987 `filename*=UTF-8''…`.
 - Document `AbortController` usage for cancelling long-lived streams. Add a test.
 - Document nested multipart with a short recipe (a part whose `Content-Type` is `multipart/*` can be fed back through `parseMultipartStream`).
 

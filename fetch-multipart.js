@@ -4,6 +4,7 @@
 //   parseMultipart(response)              -> AsyncIterable<BodyPart>
 //   parseMultipartStream(stream, boundary)-> AsyncIterable<BodyPart>
 //   getMultipartBoundary(contentType)     -> string | null
+//   parseContentDisposition(header)       -> { type, name, filename }
 //   class BodyPart implements Body
 //   class MultipartParser
 //   class MultipartParseError extends Error
@@ -439,6 +440,79 @@ export class BodyPart {
 export function getMultipartBoundary(contentType) {
   const match = /boundary\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(contentType)
   return match ? (match[1] ?? match[2].trim()) : null
+}
+
+/**
+ * @typedef {Object} ContentDispositionParts
+ * @property {string | null} type - 'form-data', 'attachment', 'inline', etc.
+ * @property {string | null} name - form field name from the `name=` parameter
+ * @property {string | null} filename - decoded filename (`filename*=` wins over `filename=`)
+ */
+
+/**
+ * Parse a `Content-Disposition` header into its components.
+ *
+ * @param {string | null} header
+ * @returns {ContentDispositionParts}
+ */
+export function parseContentDisposition(header) {
+  if (typeof header !== 'string') return { type: null, name: null, filename: null }
+
+  const segments = splitOnUnquotedSemicolon(header)
+  const type = segments[0].trim().toLowerCase() || null
+
+  const params = Object.create(null)
+  for (let i = 1; i < segments.length; i++) {
+    const eq = segments[i].indexOf('=')
+    if (eq === -1) continue
+    const key = segments[i].slice(0, eq).trim().toLowerCase()
+    let value = segments[i].slice(eq + 1).trim()
+    if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') {
+      value = value.slice(1, -1)
+    }
+    params[key] = value
+  }
+
+  const filenameStar = params['filename*']
+  const filename = filenameStar != null
+    ? decodeRfc5987(filenameStar)
+    : (params.filename ?? null)
+
+  return { type, name: params.name ?? null, filename }
+}
+
+// Split on `;` but ignore semicolons inside a quoted-string.
+function splitOnUnquotedSemicolon(input) {
+  const parts = []
+  let inQuotes = false
+  let start = 0
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i)
+    if (ch === 34 /* " */) inQuotes = !inQuotes
+    else if (ch === 59 /* ; */ && !inQuotes) {
+      parts.push(input.slice(start, i))
+      start = i + 1
+    }
+  }
+  parts.push(input.slice(start))
+  return parts
+}
+
+// Decode an RFC 5987 ext-value: charset'language'percent-encoded.
+// https://www.rfc-editor.org/rfc/rfc5987#section-3.2.1
+function decodeRfc5987(value) {
+  const firstQuote = value.indexOf("'")
+  if (firstQuote === -1) return null
+  const secondQuote = value.indexOf("'", firstQuote + 1)
+  if (secondQuote === -1) return null
+  const charset = value.slice(0, firstQuote).toLowerCase()
+  const encoded = value.slice(secondQuote + 1)
+  if (charset !== 'utf-8') return null
+  try {
+    return decodeURIComponent(encoded)
+  } catch {
+    return null
+  }
 }
 
 /**
