@@ -48,7 +48,7 @@ function createSearch(pattern) {
   }
 }
 
-// Finds the start index (within `haystack[from..]`) where a suffix of haystack
+// Find the start index (within `haystack[from..]`) where a suffix of haystack
 // matches a prefix of `pattern`. Used to detect a boundary split across chunks.
 function createPartialTailSearch(pattern) {
   const needle = utf8Encoder.encode(pattern)
@@ -112,7 +112,14 @@ export class MultipartParser {
   #currentHeader = null
   #remainingBodyBytes = 0
   #activePart = null
-  #pullHook = null
+
+  /**
+   * Driver hook: called when the active part's body stream wants more bytes.
+   * The driver should pump from its source until the controller is satisfied.
+   *
+   * @type {((part: BodyPart) => Promise<void>) | null}
+   */
+  onPull = null
 
   constructor(boundary) {
     // RFC 2046 §5.1.1 limits the boundary to 1-70 ASCII characters from a
@@ -135,8 +142,8 @@ export class MultipartParser {
     this.#boundaryBytes = utf8Encoder.encode(boundaryPattern)
   }
 
-  /** Internal: the part currently receiving body bytes, or null. */
-  get _activePart() {
+  /** The part currently receiving body bytes, or null. */
+  get activePart() {
     return this.#activePart
   }
 
@@ -228,7 +235,7 @@ export class MultipartParser {
         this.#currentHeader = chunk.subarray(index, headerEndIndex)
         index = headerEndIndex + 4 // skip \r\n\r\n
         const contentLength = extractContentLength(this.#currentHeader)
-        this.#activePart = new BodyPart(this.#currentHeader, this.#pullHook)
+        this.#activePart = new BodyPart(this.#currentHeader, this.onPull)
         yield this.#activePart
         if (contentLength >= 0) {
           this.#remainingBodyBytes = contentLength
@@ -260,7 +267,7 @@ export class MultipartParser {
             const err = new MultipartParseError(
               'Content-Length does not match actual body length',
             )
-            this.#errorActivePart(err)
+            this.abortActive(err)
             throw err
           }
         }
@@ -296,24 +303,17 @@ export class MultipartParser {
     }
     if (this.#state !== State.DONE) {
       const err = new MultipartParseError('Stream ended before final boundary')
-      this.#errorActivePart(err)
+      this.abortActive(err)
       throw err
     }
   }
 
-  /** Internal: errors the active part's body stream. */
-  _abortActive(err) {
-    this.#errorActivePart(err)
-  }
-
-  /**
-   * Internal: set a callback the active part's body stream invokes when it
-   * wants more bytes. Lets the parser's driver propagate backpressure.
-   *
-   * @param {(part: BodyPart) => Promise<void>} fn
-   */
-  _setPullHook(fn) {
-    this.#pullHook = fn
+  /** Errors the active part's body stream. Used when the source stream errors. */
+  abortActive(err) {
+    if (this.#activePart) {
+      this.#activePart._error(err)
+      this.#activePart = null
+    }
   }
 
   #routeBody(chunk) {
@@ -324,13 +324,6 @@ export class MultipartParser {
   #finalizeActivePart() {
     if (this.#activePart) {
       this.#activePart._close()
-      this.#activePart = null
-    }
-  }
-
-  #errorActivePart(err) {
-    if (this.#activePart) {
-      this.#activePart._error(err)
       this.#activePart = null
     }
   }
@@ -391,7 +384,6 @@ export class BodyPart {
   #bodyUsed = false
   /** @type {ReadableStreamDefaultController<Uint8Array> | null} */ #controller = null
   #closed = false
-  #cancelled = false
   /** @type {ReadableStream<Uint8Array>} */
   body
 
@@ -410,7 +402,6 @@ export class BodyPart {
         if (pullHook) await pullHook(self)
       },
       cancel() {
-        self.#cancelled = true
         self.#closed = true
         self.#bodyUsed = true
       },
@@ -432,20 +423,17 @@ export class BodyPart {
   async bytes() {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
-    return collectStream(this.body)
+    return new Response(this.body).bytes()
   }
 
   /** @returns {Promise<ArrayBuffer>} */
   async arrayBuffer() {
-    const bytes = await this.bytes()
-    return /** @type {ArrayBuffer} */ (bytes.buffer)
+    return /** @type {ArrayBuffer} */ ((await this.bytes()).buffer)
   }
 
   /** @returns {Promise<string>} */
   async text() {
-    if (this.#bodyUsed) throw new TypeError('Body already used')
-    this.#bodyUsed = true
-    return utf8Decoder.decode(await collectStream(this.body))
+    return utf8Decoder.decode(await this.bytes())
   }
 
   /** @returns {Promise<any>} */
@@ -458,7 +446,7 @@ export class BodyPart {
     if (this.#bodyUsed) throw new TypeError('Body already used')
     this.#bodyUsed = true
     const type = this.headers.get('content-type') ?? ''
-    return new Blob([await collectStream(this.body)], { type })
+    return new Response(this.body, { headers: { 'content-type': type } }).blob()
   }
 
   /**
@@ -483,71 +471,27 @@ export class BodyPart {
   // ---- internal: parser ----
 
   _enqueue(chunk) {
-    if (this.#cancelled || this.#closed) return
-    try {
-      this.#controller.enqueue(chunk)
-    } catch {
-      this.#cancelled = true
-      this.#closed = true
-    }
+    if (this.#closed) return
+    this.#controller.enqueue(chunk)
   }
 
   _close() {
     if (this.#closed) return
     this.#closed = true
-    try {
-      this.#controller.close()
-    } catch {
-      // Stream may already be in a terminal state.
-    }
+    this.#controller.close()
   }
 
   _error(err) {
     if (this.#closed) return
     this.#closed = true
-    try {
-      this.#controller.error(err)
-    } catch {
-      // Stream may already be in a terminal state.
-    }
+    this.#controller.error(err)
   }
 
-  _cancel() {
-    this.#cancelled = true
+  /** True when the controller still has room AND the body has not been closed. */
+  _wantsMore() {
+    if (this.#closed) return false
+    return (this.#controller.desiredSize ?? 0) > 0
   }
-
-  _isClosed() {
-    return this.#closed
-  }
-
-  _desiredSize() {
-    if (this.#cancelled) return Infinity
-    if (this.#controller === null) return 1
-    return this.#controller.desiredSize ?? 0
-  }
-}
-
-async function collectStream(stream) {
-  const reader = stream.getReader()
-  const chunks = []
-  let total = 0
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      chunks.push(value)
-      total += value.length
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  const out = new Uint8Array(total)
-  let offset = 0
-  for (const c of chunks) {
-    out.set(c, offset)
-    offset += c.length
-  }
-  return out
 }
 
 // ---------- public API ----------
@@ -667,25 +611,15 @@ async function* iterateStreamParts(stream, boundary) {
       const { done, value } = await reader.read()
       if (done) {
         sourceDone = true
-        try {
-          parser.finish()
-        } catch (err) {
-          sourceError = err
-        }
+        try { parser.finish() } catch (err) { sourceError = err }
         return
       }
       if (value.length === 0) return
-      try {
-        for (const part of parser.write(value)) partQueue.push(part)
-      } catch (err) {
-        sourceError = err
-        sourceDone = true
-        parser._abortActive(err)
-      }
+      for (const part of parser.write(value)) partQueue.push(part)
     } catch (err) {
       sourceError = err
       sourceDone = true
-      parser._abortActive(err)
+      parser.abortActive(err)
     }
   }
 
@@ -695,18 +629,13 @@ async function* iterateStreamParts(stream, boundary) {
         await pumpInflight
         continue
       }
-      pumpInflight = pumpOnce().finally(() => {
-        pumpInflight = null
-      })
+      pumpInflight = pumpOnce().finally(() => { pumpInflight = null })
       await pumpInflight
     }
   }
 
-  parser._setPullHook((part) =>
-    pumpUntil(() =>
-      sourceDone || sourceError !== null || part._isClosed() || part._desiredSize() <= 0,
-    ),
-  )
+  parser.onPull = (part) =>
+    pumpUntil(() => sourceDone || sourceError !== null || !part._wantsMore())
 
   try {
     while (true) {
@@ -720,8 +649,8 @@ async function* iterateStreamParts(stream, boundary) {
       // No part queued and source still running. If the caller iterated past
       // an unread body, cancel it so subsequent bytes are dropped while we
       // scan for the next boundary.
-      const active = parser._activePart
-      if (active) active._cancel()
+      const active = parser.activePart
+      if (active) active.body.cancel()
 
       await pumpUntil(() =>
         partQueue.length > 0 || sourceDone || sourceError !== null,
@@ -729,7 +658,7 @@ async function* iterateStreamParts(stream, boundary) {
     }
   } finally {
     reader.releaseLock()
-    parser._abortActive(new MultipartParseError('Iterator exited before stream ended'))
+    parser.abortActive(new MultipartParseError('Iterator exited before stream ended'))
   }
 }
 

@@ -752,10 +752,6 @@ function pullCountedResponse(chunks: Uint8Array[]): {
   }
 }
 
-async function flushMicrotasks() {
-  for (let i = 0; i < 5; i++) await Promise.resolve()
-}
-
 Deno.test('yields BodyPart as soon as headers parse, before body bytes arrive', async () => {
   const { response, push, close } = controllableResponse()
 
@@ -795,16 +791,18 @@ Deno.test('body bytes land on the body stream as source chunks arrive', async ()
   assertEquals(r3.done, true)
 })
 
-Deno.test('iterating past an unread body auto-drains it', async () => {
+Deno.test('iterating past an unread body auto-drains across chunks', async () => {
+  // Small chunks force the parser to yield part 1 before reaching part 2's
+  // headers, so iterating advances through the active body via cancel().
   const body = buildBody([
     { headers: ['Content-Type: text/plain'], body: 'skip-me' },
     { headers: ['Content-Type: text/plain'], body: 'keep-me' },
   ])
-  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+  const iter = chunkedResponse(body, 8).parts()[Symbol.asyncIterator]()
 
   const first = await iter.next()
   assertEquals(first.done, false)
-  // Do not read first.value!.body or call text().
+  // Do not read first.value!.body.
 
   const second = await iter.next()
   assertEquals(second.done, false)
@@ -896,7 +894,7 @@ Deno.test('backpressure: source not pulled while consumer ignores body', async (
   const { value: part } = await iter.next()
   assertEquals(part!.headers.get('content-type'), 'text/plain')
 
-  await flushMicrotasks()
+  for (let i = 0; i < 5; i++) await Promise.resolve()
   const settled = pulls()
   if (settled > 3) {
     throw new Error(`expected <= 3 pulls while body ignored, got ${settled}`)
@@ -932,19 +930,18 @@ Deno.test('large body streams without buffering all chunks', async () => {
   assertEquals(total, chunkSize * numChunks)
 })
 
-Deno.test('bodyUsed stays false when body is abandoned', async () => {
+Deno.test('auto-drain cancels the active body and flips bodyUsed', async () => {
   const body = buildBody([
-    { headers: ['Content-Type: text/plain'], body: 'first' },
-    { headers: ['Content-Type: text/plain'], body: 'second' },
+    { headers: ['Content-Type: text/plain'], body: 'skip-me' },
+    { headers: ['Content-Type: text/plain'], body: 'keep-me' },
   ])
-  const iter = singleChunkResponse(body).parts()[Symbol.asyncIterator]()
+  const iter = chunkedResponse(body, 8).parts()[Symbol.asyncIterator]()
 
   const { value: first } = await iter.next()
   assertEquals(first!.bodyUsed, false)
 
   await iter.next()
-  // Even after auto-drain, the caller never accessed first's body.
-  assertEquals(first!.bodyUsed, false)
+  assertEquals(first!.bodyUsed, true)
 })
 
 Deno.test('bodyUsed flips after body.cancel()', async () => {
