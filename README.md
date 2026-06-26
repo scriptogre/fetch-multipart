@@ -4,10 +4,10 @@ Streaming `multipart/*` parser for the browser. One file. No dependencies.
 
 ```html
 <script type="module">
-  import { parseMultipart } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+  import 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
   const response = await fetch('/stream')
-  for await (const part of parseMultipart(response)) {
+  for await (const part of response.parts()) {
     console.log(part.headers.get('content-type'))
     console.log(await part.text())
   }
@@ -18,29 +18,19 @@ Streaming `multipart/*` parser for the browser. One file. No dependencies.
 
 Parses any `multipart/*` HTTP response into an async iterable of `BodyPart` objects. Works on long-lived streaming responses (`multipart/mixed`, `multipart/x-mixed-replace`) and one-shot bodies (`multipart/form-data`, `multipart/byteranges`, etc.).
 
+Importing the module installs `Response.prototype.parts()`, mirroring the shape of `Response.prototype.formData()`. The install is conditional, so a future native implementation wins automatically.
+
 ## Usage
 
 ### Parse a multipart response
-
-```js
-import { parseMultipart } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-const response = await fetch('/stream')
-
-for await (const part of parseMultipart(response)) {
-  part.headers.get('content-type')   // 'application/json'
-  await part.json()                  // { ... }
-}
-```
-
-Or use the prollyfill (auto-installed on import):
 
 ```js
 import 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
 const response = await fetch('/stream')
 for await (const part of response.parts()) {
-  await part.text()
+  part.headers.get('content-type')   // 'application/json'
+  await part.json()                  // { ... }
 }
 ```
 
@@ -62,77 +52,18 @@ for await (const part of response.parts()) {
 
 A `BodyPart` is the MIME entity from [RFC 2046 §5.1](https://www.rfc-editor.org/rfc/rfc2046#section-5.1): headers and a body. No status code, no URL.
 
-### Parse a raw byte stream
-
-When you already have a `ReadableStream<Uint8Array>` and the boundary string:
-
-```js
-import { parseMultipartStream } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-for await (const part of parseMultipartStream(stream, boundary)) {
-  await part.text()
-}
-```
-
-### Extract the boundary from a Content-Type header
-
-```js
-import { getMultipartBoundary } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-getMultipartBoundary('multipart/mixed; boundary=abc')   // 'abc'
-getMultipartBoundary('text/plain')                      // null
-```
-
-### Drive the parser by hand
-
-For non-stream sources, feed bytes directly:
-
-```js
-import { MultipartParser } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-const parser = new MultipartParser(boundary)
-for (const chunk of chunks) {
-  for (const part of parser.write(chunk)) {
-    await part.text()
-  }
-}
-parser.finish()
-```
-
-### Handle errors
-
-Errors are `MultipartParseError`, which extends `TypeError` (matching the [WHATWG Fetch convention](https://fetch.spec.whatwg.org/#dom-body-formdata) for `Body` method errors):
-
-```js
-import { MultipartParseError } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-try {
-  for await (const part of response.parts()) { /* ... */ }
-} catch (err) {
-  err instanceof TypeError              // true
-  err instanceof MultipartParseError    // true
-}
-```
-
 ### Parse a nested multipart part
 
-When a part's `Content-Type` is itself `multipart/*` (`multipart/related`, `multipart/alternative`, etc.), feed its body back through `parseMultipartStream` with the inner boundary:
+When a part's `Content-Type` is itself `multipart/*` (`multipart/related`, `multipart/alternative`, etc.), call `parts()` on the part the same way:
 
 ```js
-import {
-  getMultipartBoundary,
-  parseMultipart,
-  parseMultipartStream,
-} from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
-
-for await (const part of parseMultipart(response)) {
+for await (const part of response.parts()) {
   const contentType = part.headers.get('content-type') ?? ''
   if (!contentType.startsWith('multipart/')) {
     await part.text()
     continue
   }
-  const boundary = getMultipartBoundary(contentType)
-  for await (const inner of parseMultipartStream(part.body, boundary)) {
+  for await (const inner of part.parts()) {
     await inner.text()
   }
 }
@@ -155,6 +86,76 @@ try {
 } catch (err) {
   if (err.name !== 'AbortError') throw err
 }
+```
+
+### Handle errors
+
+Errors are `MultipartParseError`, which extends `TypeError` (matching the [WHATWG Fetch convention](https://fetch.spec.whatwg.org/#dom-body-formdata) for `Body` method errors):
+
+```js
+import { MultipartParseError } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+try {
+  for await (const part of response.parts()) { /* ... */ }
+} catch (err) {
+  err instanceof TypeError              // true
+  err instanceof MultipartParseError    // true
+}
+```
+
+## Helpers
+
+### `getMultipartBoundary(contentType)`
+
+Extract the boundary parameter from a `Content-Type` header:
+
+```js
+import { getMultipartBoundary } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+getMultipartBoundary('multipart/mixed; boundary=abc')   // 'abc'
+getMultipartBoundary('text/plain')                      // null
+```
+
+### `parseContentDisposition(header)`
+
+Parse a `Content-Disposition` header into `{ type, name, filename }`. Handles quoted values and RFC 5987 (`filename*=UTF-8''…`) encoding:
+
+```js
+import { parseContentDisposition } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+parseContentDisposition('form-data; name="file"; filename="resume.pdf"')
+// → { type: 'form-data', name: 'file', filename: 'resume.pdf' }
+```
+
+## Lower-level API
+
+### Parse a raw byte stream
+
+When you have a `ReadableStream<Uint8Array>` and a boundary but no `Response`, wrap the stream:
+
+```js
+const response = new Response(stream, {
+  headers: { 'content-type': `multipart/mixed; boundary=${boundary}` },
+})
+for await (const part of response.parts()) {
+  await part.text()
+}
+```
+
+### Drive the parser by hand
+
+For non-stream sources, feed bytes directly:
+
+```js
+import { MultipartParser } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+const parser = new MultipartParser(boundary)
+for (const chunk of chunks) {
+  for (const part of parser.write(chunk)) {
+    await part.text()
+  }
+}
+parser.finish()
 ```
 
 ## Behavior

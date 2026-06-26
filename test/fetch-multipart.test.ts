@@ -6,8 +6,6 @@ import {
   MultipartParser,
   getMultipartBoundary,
   parseContentDisposition,
-  parseMultipart,
-  parseMultipartStream,
 } from '../fetch-multipart.js'
 
 // Type augmentation for the Response.prototype.parts prollyfill.
@@ -79,7 +77,7 @@ function singleChunkResponse(body: Uint8Array): Response {
 
 async function collect(response: Response): Promise<BodyPart[]> {
   const parts: BodyPart[] = []
-  for await (const part of parseMultipart(response)) parts.push(part)
+  for await (const part of response.parts()) parts.push(part)
   return parts
 }
 
@@ -201,7 +199,7 @@ Deno.test('parseContentDisposition: empty header returns all nulls', () => {
   )
 })
 
-// ---------- parseMultipart: happy paths ----------
+// ---------- Response.prototype.parts(): happy paths ----------
 
 Deno.test('parses an empty multipart message', async () => {
   const body = bytes(`--${BOUNDARY}--`)
@@ -396,14 +394,14 @@ Deno.test('parses correctly across many small chunks', async () => {
 Deno.test('throws when Content-Type is not multipart/*', async () => {
   const response = new Response('hello', { headers: { 'content-type': 'text/plain' } })
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(response)) void _
+    for await (const _ of response.parts()) void _
   }, MultipartParseError)
 })
 
 Deno.test('throws when Content-Type has no boundary', async () => {
   const response = new Response('hello', { headers: { 'content-type': 'multipart/mixed' } })
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(response)) void _
+    for await (const _ of response.parts()) void _
   }, MultipartParseError)
 })
 
@@ -412,14 +410,14 @@ Deno.test('throws when response body is null', async () => {
     headers: { 'content-type': `multipart/mixed; boundary=${BOUNDARY}` },
   })
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(response)) void _
+    for await (const _ of response.parts()) void _
   }, MultipartParseError)
 })
 
 Deno.test('throws when stream contains no boundary at all', async () => {
   const raw = `Content-Type: text/plain${CRLF}${CRLF}value1`
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(singleChunkResponse(bytes(raw)))) void _
+    for await (const _ of singleChunkResponse(bytes(raw)).parts()) void _
   }, MultipartParseError)
 })
 
@@ -430,7 +428,7 @@ Deno.test('throws when final closing boundary is missing', async () => {
     `value1${CRLF}` +
     `--${BOUNDARY}`
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(singleChunkResponse(bytes(raw)))) void _
+    for await (const _ of singleChunkResponse(bytes(raw)).parts()) void _
   }, MultipartParseError)
 })
 
@@ -500,7 +498,7 @@ Deno.test('throws when Content-Length disagrees with body length', async () => {
     { headers: ['Content-Length: 3'], body: 'hello' },
   ])
   await assertRejects(async () => {
-    for await (const _ of parseMultipart(singleChunkResponse(body))) void _
+    for await (const _ of singleChunkResponse(body).parts()) void _
   }, MultipartParseError)
 })
 
@@ -532,7 +530,7 @@ Deno.test('Content-Length works when chunks split the body', async () => {
     { headers: ['Content-Length: 11'], body: 'hello world' },
   ])
   const parts: BodyPart[] = []
-  for await (const part of parseMultipart(chunkedResponse(body, 1))) parts.push(part)
+  for await (const part of chunkedResponse(body, 1).parts()) parts.push(part)
   assertEquals(await parts[0].text(), 'hello world')
 })
 
@@ -602,39 +600,63 @@ Deno.test('ignores epilogue split across chunks', async () => {
 
 // ---------- nested multipart ----------
 
-Deno.test('a part whose body is itself multipart/* can be re-parsed', async () => {
-  const INNER = '----InnerBoundary'
+const INNER_BOUNDARY = '----InnerBoundary'
 
+function buildNestedOuterBody(): Uint8Array {
   const innerBody =
-    `--${INNER}${CRLF}` +
+    `--${INNER_BOUNDARY}${CRLF}` +
     `Content-Type: text/plain${CRLF}${CRLF}` +
     `inner-one${CRLF}` +
-    `--${INNER}${CRLF}` +
+    `--${INNER_BOUNDARY}${CRLF}` +
     `Content-Type: text/plain${CRLF}${CRLF}` +
     `inner-two${CRLF}` +
-    `--${INNER}--`
+    `--${INNER_BOUNDARY}--`
 
   const outerRaw =
     `--${BOUNDARY}${CRLF}` +
-    `Content-Type: multipart/mixed; boundary=${INNER}${CRLF}${CRLF}` +
+    `Content-Type: multipart/mixed; boundary=${INNER_BOUNDARY}${CRLF}${CRLF}` +
     innerBody +
     `${CRLF}--${BOUNDARY}--`
 
-  const outerParts = await collect(singleChunkResponse(bytes(outerRaw)))
+  return bytes(outerRaw)
+}
+
+Deno.test('BodyPart.parts() recurses into a multipart/* part body', async () => {
+  const outerParts = await collect(singleChunkResponse(buildNestedOuterBody()))
   assertEquals(outerParts.length, 1)
 
-  const outerPart = outerParts[0]
-  const contentType = outerPart.headers.get('content-type')!
-  assertEquals(getMultipartBoundary(contentType), INNER)
-
   const innerParts: BodyPart[] = []
-  for await (const inner of parseMultipartStream(outerPart.body, INNER)) {
+  for await (const inner of outerParts[0].parts()) {
     innerParts.push(inner)
   }
 
   assertEquals(innerParts.length, 2)
   assertEquals(await innerParts[0].text(), 'inner-one')
   assertEquals(await innerParts[1].text(), 'inner-two')
+})
+
+Deno.test('BodyPart.parts() throws when Content-Type is not multipart/*', async () => {
+  const body = buildBody([{ headers: ['Content-Type: text/plain'], body: 'hello' }])
+  const parts = await collect(singleChunkResponse(body))
+  await assertRejects(async () => {
+    for await (const _ of parts[0].parts()) void _
+  }, MultipartParseError)
+})
+
+Deno.test('BodyPart.parts() throws when Content-Type has no boundary', async () => {
+  const body = buildBody([{ headers: ['Content-Type: multipart/mixed'], body: 'irrelevant' }])
+  const parts = await collect(singleChunkResponse(body))
+  await assertRejects(async () => {
+    for await (const _ of parts[0].parts()) void _
+  }, MultipartParseError)
+})
+
+Deno.test('BodyPart.parts() throws when the body is already consumed', async () => {
+  const outerParts = await collect(singleChunkResponse(buildNestedOuterBody()))
+  await outerParts[0].text()
+  await assertRejects(async () => {
+    for await (const _ of outerParts[0].parts()) void _
+  }, TypeError)
 })
 
 // ---------- AbortController cancellation ----------
@@ -660,11 +682,14 @@ Deno.test('AbortSignal cancels mid-stream and propagates the abort error', async
       ctrl.close()
     },
   })
+  const response = new Response(stream, {
+    headers: { 'content-type': `multipart/mixed; boundary=${BOUNDARY}` },
+  })
 
   let parts = 0
   let error: unknown = null
   try {
-    for await (const part of parseMultipartStream(stream, BOUNDARY)) {
+    for await (const part of response.parts()) {
       parts++
       await part.text()
       if (parts === 1) controller.abort()
@@ -678,15 +703,13 @@ Deno.test('AbortSignal cancels mid-stream and propagates the abort error', async
   assertEquals((error as DOMException).name, 'AbortError')
 })
 
-// ---------- parseMultipartStream ----------
-
 // ---------- Response.prototype.parts prollyfill ----------
 
 Deno.test('installs Response.prototype.parts', () => {
   assertEquals(typeof Response.prototype.parts, 'function')
 })
 
-Deno.test('response.parts() yields the same parts as parseMultipart(response)', async () => {
+Deno.test('response.parts() iterates the parts of a multipart response', async () => {
   const body = buildBody([
     { headers: ['Content-Type: text/plain'], body: 'one' },
     { headers: ['Content-Type: text/plain'], body: 'two' },
@@ -698,20 +721,4 @@ Deno.test('response.parts() yields the same parts as parseMultipart(response)', 
   assertEquals(parts.length, 2)
   assertEquals(await parts[0].text(), 'one')
   assertEquals(await parts[1].text(), 'two')
-})
-
-Deno.test('parseMultipartStream parses with explicit boundary', async () => {
-  const body = buildBody([{ headers: ['Content-Type: text/plain'], body: 'streamed' }])
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(body)
-      controller.close()
-    },
-  })
-
-  const parts: BodyPart[] = []
-  for await (const part of parseMultipartStream(stream, BOUNDARY)) parts.push(part)
-
-  assertEquals(parts.length, 1)
-  assertEquals(await parts[0].text(), 'streamed')
 })

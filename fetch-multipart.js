@@ -1,8 +1,8 @@
 // Streaming multipart parser for the browser.
 //
 // Public API:
-//   parseMultipart(response)              -> AsyncIterable<BodyPart>
-//   parseMultipartStream(stream, boundary)-> AsyncIterable<BodyPart>
+//   Response.prototype.parts()            -> AsyncIterable<BodyPart>
+//   BodyPart.prototype.parts()            -> AsyncIterable<BodyPart>
 //   getMultipartBoundary(contentType)     -> string | null
 //   parseContentDisposition(header)       -> { type, name, filename }
 //   class BodyPart implements Body
@@ -354,7 +354,8 @@ function concatChunks(chunks) {
 }
 
 /**
- * A MIME body part. Implements the WHATWG Fetch `Body` interface.
+ * A MIME body part. Implements the WHATWG Fetch `Body` interface plus a
+ * `parts()` method for recursing into nested `multipart/*` bodies.
  */
 export class BodyPart {
   /** @type {Uint8Array[]} */ #content
@@ -420,6 +421,26 @@ export class BodyPart {
   /** @returns {Promise<any>} */
   async json() {
     return JSON.parse(await this.text())
+  }
+
+  /**
+   * Parse this part's body as a nested `multipart/*` message.
+   * Mirrors `Response.prototype.parts()`.
+   *
+   * @returns {AsyncGenerator<BodyPart, void, unknown>}
+   */
+  async *parts() {
+    if (this.#bodyUsed) throw new TypeError('Body already used')
+    this.#bodyUsed = true
+    const contentType = this.headers.get('content-type')
+    if (!contentType || !contentType.toLowerCase().startsWith('multipart/')) {
+      throw new MultipartParseError('Content-Type is not multipart/*')
+    }
+    const boundary = getMultipartBoundary(contentType)
+    if (!boundary) {
+      throw new MultipartParseError('Content-Type has no boundary parameter')
+    }
+    yield* iterateStreamParts(this.body, boundary)
   }
 
   /** @returns {Promise<Blob>} */
@@ -515,13 +536,8 @@ function decodeRfc5987(value) {
   }
 }
 
-/**
- * Parse a `multipart/*` HTTP response into an async iterable of {@link BodyPart}.
- *
- * @param {Response} response
- * @returns {AsyncGenerator<BodyPart, void, unknown>}
- */
-export async function* parseMultipart(response) {
+// Iterate the parts of a `Response` whose Content-Type is `multipart/*`.
+async function* iterateResponseParts(response) {
   const contentType = response.headers.get('content-type')
   if (!contentType || !contentType.toLowerCase().startsWith('multipart/')) {
     throw new MultipartParseError('Content-Type is not multipart/*')
@@ -533,17 +549,11 @@ export async function* parseMultipart(response) {
   if (!boundary) {
     throw new MultipartParseError('Content-Type has no boundary parameter')
   }
-  yield* parseMultipartStream(response.body, boundary)
+  yield* iterateStreamParts(response.body, boundary)
 }
 
-/**
- * Parse a stream of `multipart/*` bytes given an explicit boundary.
- *
- * @param {ReadableStream<Uint8Array>} stream
- * @param {string} boundary
- * @returns {AsyncGenerator<BodyPart, void, unknown>}
- */
-export async function* parseMultipartStream(stream, boundary) {
+// Drive the parser over a `ReadableStream<Uint8Array>` with a known boundary.
+async function* iterateStreamParts(stream, boundary) {
   const parser = new MultipartParser(boundary)
   const reader = stream.getReader()
   try {
@@ -568,7 +578,7 @@ export async function* parseMultipartStream(stream, boundary) {
 if (typeof Response !== 'undefined' && typeof Response.prototype.parts !== 'function') {
   Object.defineProperty(Response.prototype, 'parts', {
     value: function parts() {
-      return parseMultipart(this)
+      return iterateResponseParts(this)
     },
     writable: true,
     configurable: true,
