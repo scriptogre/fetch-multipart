@@ -72,13 +72,28 @@ function createPartialTailSearch(pattern) {
 
 // ---------- parser state machine ----------
 
-const STATE_START = 0
-const STATE_AFTER_BOUNDARY = 1
-const STATE_HEADER = 2
-const STATE_BODY = 3
-const STATE_DONE = 4
+const State = Object.freeze({
+  // Expect the opening "--boundary".
+  START: 0,
+  // After a boundary, read "\r\n" or "--".
+  READING_BOUNDARY_SUFFIX: 1,
+  // Read part headers through "\r\n\r\n".
+  READING_HEADERS: 2,
+  // No Content-Length. Scan for the next boundary.
+  READING_BODY_UNTIL_BOUNDARY: 3,
+  // Read exactly the declared Content-Length bytes.
+  READING_BODY_WITH_CONTENT_LENGTH: 4,
+  // Final "--" after a boundary was read.
+  DONE: 5,
+})
 
 const findDoubleNewline = createSearch('\r\n\r\n')
+const contentLengthRegex = /^content-length:\s*(\d+)/im
+
+function extractContentLength(headerBytes) {
+  const match = contentLengthRegex.exec(utf8Decoder.decode(headerBytes))
+  return match ? Number(match[1]) : -1
+}
 
 export class MultipartParser {
   #findOpeningBoundary
@@ -88,10 +103,11 @@ export class MultipartParser {
   #boundaryLength
   #boundaryBytes
 
-  #state = STATE_START
+  #state = State.START
   #buffer = null
   #currentHeader = null
   #currentContent = null
+  #remainingBodyBytes = 0
 
   constructor(boundary) {
     // RFC 2046 §5.1.1 limits the boundary to 1-70 ASCII characters from a
@@ -115,7 +131,7 @@ export class MultipartParser {
   }
 
   *write(chunk) {
-    if (this.#state === STATE_DONE) {
+    if (this.#state === State.DONE) {
       throw new MultipartParseError('Unexpected data after final boundary')
     }
 
@@ -123,7 +139,7 @@ export class MultipartParser {
     let chunkLength = chunk.length
 
     if (this.#buffer !== null) {
-      if (this.#state === STATE_BODY) {
+      if (this.#state === State.READING_BODY_UNTIL_BOUNDARY) {
         const carry = this.#buffer
         const carryResult = this.#analyzeCarryBoundary(carry, chunk)
 
@@ -141,7 +157,7 @@ export class MultipartParser {
         } else {
           if (carryResult.start > 0) this.#append(carry.subarray(0, carryResult.start))
           yield this.#createPart()
-          this.#state = STATE_AFTER_BOUNDARY
+          this.#state = State.READING_BOUNDARY_SUFFIX
           const carryAfterStart = carry.length - carryResult.start
           index = this.#boundaryLength - carryAfterStart
         }
@@ -157,7 +173,7 @@ export class MultipartParser {
     }
 
     while (true) {
-      if (this.#state === STATE_BODY) {
+      if (this.#state === State.READING_BODY_UNTIL_BOUNDARY) {
         if (chunkLength - index < this.#boundaryLength) {
           this.#buffer = chunk.subarray(index)
           break
@@ -178,24 +194,24 @@ export class MultipartParser {
         if (boundaryIndex > index) this.#append(chunk.subarray(index, boundaryIndex))
         yield this.#createPart()
         index = boundaryIndex + this.#boundaryLength
-        this.#state = STATE_AFTER_BOUNDARY
+        this.#state = State.READING_BOUNDARY_SUFFIX
       }
 
-      if (this.#state === STATE_AFTER_BOUNDARY) {
+      if (this.#state === State.READING_BOUNDARY_SUFFIX) {
         if (chunkLength - index < 2) {
           this.#buffer = chunk.subarray(index)
           break
         }
         // Closing boundary is followed by '--'.
         if (chunk[index] === 45 && chunk[index + 1] === 45) {
-          this.#state = STATE_DONE
+          this.#state = State.DONE
           break
         }
         index += 2 // skip \r\n
-        this.#state = STATE_HEADER
+        this.#state = State.READING_HEADERS
       }
 
-      if (this.#state === STATE_HEADER) {
+      if (this.#state === State.READING_HEADERS) {
         if (chunkLength - index < 4) {
           this.#buffer = chunk.subarray(index)
           break
@@ -208,11 +224,46 @@ export class MultipartParser {
         this.#currentHeader = chunk.subarray(index, headerEndIndex)
         this.#currentContent = []
         index = headerEndIndex + 4 // skip \r\n\r\n
-        this.#state = STATE_BODY
+        const contentLength = extractContentLength(this.#currentHeader)
+        if (contentLength >= 0) {
+          this.#remainingBodyBytes = contentLength
+          this.#state = State.READING_BODY_WITH_CONTENT_LENGTH
+        } else {
+          this.#state = State.READING_BODY_UNTIL_BOUNDARY
+        }
         continue
       }
 
-      if (this.#state === STATE_START) {
+      // Fast path: the part declared its size, so read exactly that many
+      // body bytes, then expect the boundary to immediately follow.
+      if (this.#state === State.READING_BODY_WITH_CONTENT_LENGTH) {
+        const bodyBytes = Math.min(this.#remainingBodyBytes, chunkLength - index)
+        this.#append(chunk.subarray(index, index + bodyBytes))
+        this.#remainingBodyBytes -= bodyBytes
+        index += bodyBytes
+
+        if (this.#remainingBodyBytes > 0) {
+          this.#buffer = chunk.subarray(index)
+          break
+        }
+        if (chunkLength - index < this.#boundaryLength) {
+          this.#buffer = chunk.subarray(index)
+          break
+        }
+        for (let i = 0; i < this.#boundaryLength; i++) {
+          if (chunk[index + i] !== this.#boundaryBytes[i]) {
+            throw new MultipartParseError(
+              'Content-Length does not match actual body length',
+            )
+          }
+        }
+
+        yield this.#createPart()
+        index += this.#boundaryLength
+        this.#state = State.READING_BOUNDARY_SUFFIX
+      }
+
+      if (this.#state === State.START) {
         if (chunkLength < this.#openingBoundaryLength) {
           this.#buffer = chunk
           break
@@ -221,13 +272,13 @@ export class MultipartParser {
           throw new MultipartParseError('Missing initial boundary')
         }
         index = this.#openingBoundaryLength
-        this.#state = STATE_AFTER_BOUNDARY
+        this.#state = State.READING_BOUNDARY_SUFFIX
       }
     }
   }
 
   finish() {
-    if (this.#state !== STATE_DONE) {
+    if (this.#state !== State.DONE) {
       throw new MultipartParseError('Stream ended before final boundary')
     }
   }

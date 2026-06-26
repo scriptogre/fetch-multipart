@@ -377,6 +377,72 @@ function assertThrowsConstructor(boundary: string) {
   assertEquals(threw, true)
 }
 
+// ---------- Content-Length-aware parsing ----------
+
+Deno.test('honors Content-Length when present', async () => {
+  const body = buildBody([
+    { headers: ['Content-Type: text/plain', 'Content-Length: 5'], body: 'hello' },
+  ])
+  const parts = await collect(singleChunkResponse(body))
+  assertEquals(await parts[0].text(), 'hello')
+})
+
+Deno.test('honors Content-Length: 0 (empty body)', async () => {
+  const body = buildBody([{ headers: ['Content-Length: 0'], body: '' }])
+  const parts = await collect(singleChunkResponse(body))
+  assertEquals((await parts[0].bytes()).length, 0)
+})
+
+Deno.test('throws when Content-Length disagrees with body length', async () => {
+  // Claims Content-Length: 3 but the body is 5 bytes.
+  const body = buildBody([
+    { headers: ['Content-Length: 3'], body: 'hello' },
+  ])
+  await assertRejects(async () => {
+    for await (const _ of parseMultipart(singleChunkResponse(body))) void _
+  }, MultipartParseError)
+})
+
+Deno.test('handles a mix of Content-Length and unsized parts', async () => {
+  const body = buildBody([
+    { headers: ['Content-Length: 5'], body: 'hello' },
+    { headers: ['Content-Type: text/plain'], body: 'world' },
+  ])
+  const parts = await collect(singleChunkResponse(body))
+  assertEquals(parts.length, 2)
+  assertEquals(await parts[0].text(), 'hello')
+  assertEquals(await parts[1].text(), 'world')
+})
+
+Deno.test('Content-Length lets a part body legally contain the boundary marker', async () => {
+  // Body contains literal "\r\n--<boundary>" bytes. Without Content-Length the
+  // boundary scanner would terminate the part early. With Content-Length the
+  // parser reads exactly N bytes and ignores the embedded marker.
+  const sneaky = `prefix\r\n--${BOUNDARY}\r\nfake\r\n--${BOUNDARY}--suffix`
+  const body = buildBody([
+    { headers: [`Content-Length: ${bytes(sneaky).length}`], body: sneaky },
+  ])
+  const parts = await collect(singleChunkResponse(body))
+  assertEquals(await parts[0].text(), sneaky)
+})
+
+Deno.test('Content-Length works when chunks split the body', async () => {
+  const body = buildBody([
+    { headers: ['Content-Length: 11'], body: 'hello world' },
+  ])
+  const parts: BodyPart[] = []
+  for await (const part of parseMultipart(chunkedResponse(body, 1))) parts.push(part)
+  assertEquals(await parts[0].text(), 'hello world')
+})
+
+Deno.test('Content-Length header name is case-insensitive', async () => {
+  const body = buildBody([
+    { headers: ['CONTENT-LENGTH: 3'], body: 'abc' },
+  ])
+  const parts = await collect(singleChunkResponse(body))
+  assertEquals(await parts[0].text(), 'abc')
+})
+
 // ---------- parseMultipartStream ----------
 
 // ---------- Response.prototype.multipart prollyfill ----------
