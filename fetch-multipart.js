@@ -73,7 +73,7 @@ function createPartialTailSearch(pattern) {
 // ---------- parser state machine ----------
 
 const State = Object.freeze({
-  // Expect the opening "--boundary".
+  // Scan for the opening "--boundary", discarding any preamble bytes.
   START: 0,
   // After a boundary, read "\r\n" or "--".
   READING_BOUNDARY_SUFFIX: 1,
@@ -131,9 +131,9 @@ export class MultipartParser {
   }
 
   *write(chunk) {
-    if (this.#state === State.DONE) {
-      throw new MultipartParseError('Unexpected data after final boundary')
-    }
+    // Discard epilogue bytes after the closing boundary (RFC 2046 §5.1.1).
+    // https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if (this.#state === State.DONE) return
 
     let index = 0
     let chunkLength = chunk.length
@@ -268,10 +268,15 @@ export class MultipartParser {
           this.#buffer = chunk
           break
         }
-        if (this.#findOpeningBoundary(chunk) !== 0) {
-          throw new MultipartParseError('Missing initial boundary')
+        // Discard preamble bytes before the opening boundary (RFC 2046 §5.1.1).
+        // https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+        const openingIndex = this.#findOpeningBoundary(chunk)
+        if (openingIndex === -1) {
+          const tailStart = chunkLength - (this.#openingBoundaryLength - 1)
+          this.#buffer = chunk.subarray(tailStart)
+          break
         }
-        index = this.#openingBoundaryLength
+        index = openingIndex + this.#openingBoundaryLength
         this.#state = State.READING_BOUNDARY_SUFFIX
       }
     }
@@ -432,8 +437,8 @@ export class BodyPart {
  * @returns {string | null}
  */
 export function getMultipartBoundary(contentType) {
-  const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType)
-  return match ? (match[1] ?? match[2]) : null
+  const match = /boundary\s*=\s*(?:"([^"]+)"|([^;]+))/i.exec(contentType)
+  return match ? (match[1] ?? match[2].trim()) : null
 }
 
 /**

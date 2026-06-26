@@ -100,6 +100,18 @@ Deno.test('getMultipartBoundary: returns null for non-multipart type', () => {
   assertEquals(getMultipartBoundary('text/plain'), null)
 })
 
+Deno.test('getMultipartBoundary: trims trailing whitespace in the bare form', () => {
+  assertEquals(getMultipartBoundary('multipart/mixed; boundary=abc ; charset=utf-8'), 'abc')
+})
+
+Deno.test('getMultipartBoundary: tolerates whitespace around the equals sign', () => {
+  assertEquals(getMultipartBoundary('multipart/mixed; boundary = abc'), 'abc')
+})
+
+Deno.test('getMultipartBoundary: preserves whitespace inside the quoted form', () => {
+  assertEquals(getMultipartBoundary('multipart/mixed; boundary=" abc "'), ' abc ')
+})
+
 // ---------- parseMultipart: happy paths ----------
 
 Deno.test('parses an empty multipart message', async () => {
@@ -315,8 +327,8 @@ Deno.test('throws when response body is null', async () => {
   }, MultipartParseError)
 })
 
-Deno.test('throws when initial boundary is missing', async () => {
-  const raw = `Content-Type: text/plain${CRLF}${CRLF}value1${CRLF}--${BOUNDARY}--`
+Deno.test('throws when stream contains no boundary at all', async () => {
+  const raw = `Content-Type: text/plain${CRLF}${CRLF}value1`
   await assertRejects(async () => {
     for await (const _ of parseMultipart(singleChunkResponse(bytes(raw)))) void _
   }, MultipartParseError)
@@ -441,6 +453,62 @@ Deno.test('Content-Length header name is case-insensitive', async () => {
   ])
   const parts = await collect(singleChunkResponse(body))
   assertEquals(await parts[0].text(), 'abc')
+})
+
+// ---------- preamble and epilogue (RFC 2046 §5.1.1) ----------
+
+Deno.test('ignores preamble before the first boundary', async () => {
+  const raw =
+    `This is a preamble that some MIME senders include.${CRLF}` +
+    `It must be discarded.${CRLF}` +
+    `--${BOUNDARY}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `payload${CRLF}` +
+    `--${BOUNDARY}--`
+  const parts = await collect(singleChunkResponse(bytes(raw)))
+
+  assertEquals(parts.length, 1)
+  assertEquals(await parts[0].text(), 'payload')
+})
+
+Deno.test('ignores preamble split across chunks', async () => {
+  const raw =
+    `preamble bytes that span more than one chunk boundary${CRLF}` +
+    `--${BOUNDARY}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `payload${CRLF}` +
+    `--${BOUNDARY}--`
+  const parts = await collect(chunkedResponse(bytes(raw), 8))
+
+  assertEquals(parts.length, 1)
+  assertEquals(await parts[0].text(), 'payload')
+})
+
+Deno.test('ignores epilogue after the closing boundary', async () => {
+  const raw =
+    `--${BOUNDARY}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `payload${CRLF}` +
+    `--${BOUNDARY}--${CRLF}` +
+    `Trailing epilogue text that some senders include.${CRLF}` +
+    `It must be discarded.`
+  const parts = await collect(singleChunkResponse(bytes(raw)))
+
+  assertEquals(parts.length, 1)
+  assertEquals(await parts[0].text(), 'payload')
+})
+
+Deno.test('ignores epilogue split across chunks', async () => {
+  const raw =
+    `--${BOUNDARY}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `payload${CRLF}` +
+    `--${BOUNDARY}--${CRLF}` +
+    `epilogue bytes that span more than one chunk boundary`
+  const parts = await collect(chunkedResponse(bytes(raw), 8))
+
+  assertEquals(parts.length, 1)
+  assertEquals(await parts[0].text(), 'payload')
 })
 
 // ---------- parseMultipartStream ----------
