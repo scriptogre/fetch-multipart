@@ -114,6 +114,30 @@ try {
 }
 ```
 
+### Parse a nested multipart part
+
+When a part's `Content-Type` is itself `multipart/*` (`multipart/related`, `multipart/alternative`, etc.), feed its body back through `parseMultipartStream` with the inner boundary:
+
+```js
+import {
+  getMultipartBoundary,
+  parseMultipart,
+  parseMultipartStream,
+} from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
+
+for await (const part of parseMultipart(response)) {
+  const contentType = part.headers.get('content-type') ?? ''
+  if (!contentType.startsWith('multipart/')) {
+    await part.text()
+    continue
+  }
+  const boundary = getMultipartBoundary(contentType)
+  for await (const inner of parseMultipartStream(part.body, boundary)) {
+    await inner.text()
+  }
+}
+```
+
 ### Cancel a long-lived stream
 
 Pass an `AbortSignal` to `fetch`. When you call `controller.abort()`, the response body stream errors and the iterator throws a `DOMException` with `name === 'AbortError'`.

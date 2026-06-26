@@ -600,6 +600,43 @@ Deno.test('ignores epilogue split across chunks', async () => {
   assertEquals(await parts[0].text(), 'payload')
 })
 
+// ---------- nested multipart ----------
+
+Deno.test('a part whose body is itself multipart/* can be re-parsed', async () => {
+  const INNER = '----InnerBoundary'
+
+  const innerBody =
+    `--${INNER}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `inner-one${CRLF}` +
+    `--${INNER}${CRLF}` +
+    `Content-Type: text/plain${CRLF}${CRLF}` +
+    `inner-two${CRLF}` +
+    `--${INNER}--`
+
+  const outerRaw =
+    `--${BOUNDARY}${CRLF}` +
+    `Content-Type: multipart/mixed; boundary=${INNER}${CRLF}${CRLF}` +
+    innerBody +
+    `${CRLF}--${BOUNDARY}--`
+
+  const outerParts = await collect(singleChunkResponse(bytes(outerRaw)))
+  assertEquals(outerParts.length, 1)
+
+  const outerPart = outerParts[0]
+  const contentType = outerPart.headers.get('content-type')!
+  assertEquals(getMultipartBoundary(contentType), INNER)
+
+  const innerParts: BodyPart[] = []
+  for await (const inner of parseMultipartStream(outerPart.body, INNER)) {
+    innerParts.push(inner)
+  }
+
+  assertEquals(innerParts.length, 2)
+  assertEquals(await innerParts[0].text(), 'inner-one')
+  assertEquals(await innerParts[1].text(), 'inner-two')
+})
+
 // ---------- AbortController cancellation ----------
 
 Deno.test('AbortSignal cancels mid-stream and propagates the abort error', async () => {
