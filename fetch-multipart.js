@@ -559,15 +559,15 @@ export async function* parseMultipartStream(stream, boundary) {
   parser.finish()
 }
 
-// ---------- prollyfill: Response.prototype.multipart() ----------
+// ---------- prollyfill: Response.prototype.parts() ----------
 //
-// Speculative install of a `multipart()` method on Response. Mirrors the shape
-// of `Response.prototype.formData()`. Conditional so a future native version
-// wins automatically.
+// Speculative install of a `parts()` method on Response. Mirrors the shape of
+// `Response.prototype.formData()`. Conditional so a future native version wins
+// automatically.
 
-if (typeof Response !== 'undefined' && typeof Response.prototype.multipart !== 'function') {
-  Object.defineProperty(Response.prototype, 'multipart', {
-    value: function multipart() {
+if (typeof Response !== 'undefined' && typeof Response.prototype.parts !== 'function') {
+  Object.defineProperty(Response.prototype, 'parts', {
+    value: function parts() {
       return parseMultipart(this)
     },
     writable: true,

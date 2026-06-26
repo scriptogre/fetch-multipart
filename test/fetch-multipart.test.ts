@@ -10,10 +10,10 @@ import {
   parseMultipartStream,
 } from '../fetch-multipart.js'
 
-// Type augmentation for the Response.prototype.multipart prollyfill.
+// Type augmentation for the Response.prototype.parts prollyfill.
 declare global {
   interface Response {
-    multipart(): AsyncIterable<BodyPart>
+    parts(): AsyncIterable<BodyPart>
   }
 }
 
@@ -602,20 +602,20 @@ Deno.test('ignores epilogue split across chunks', async () => {
 
 // ---------- parseMultipartStream ----------
 
-// ---------- Response.prototype.multipart prollyfill ----------
+// ---------- Response.prototype.parts prollyfill ----------
 
-Deno.test('installs Response.prototype.multipart', () => {
-  assertEquals(typeof Response.prototype.multipart, 'function')
+Deno.test('installs Response.prototype.parts', () => {
+  assertEquals(typeof Response.prototype.parts, 'function')
 })
 
-Deno.test('response.multipart() yields the same parts as parseMultipart(response)', async () => {
+Deno.test('response.parts() yields the same parts as parseMultipart(response)', async () => {
   const body = buildBody([
     { headers: ['Content-Type: text/plain'], body: 'one' },
     { headers: ['Content-Type: text/plain'], body: 'two' },
   ])
 
   const parts: BodyPart[] = []
-  for await (const part of singleChunkResponse(body).multipart()) parts.push(part)
+  for await (const part of singleChunkResponse(body).parts()) parts.push(part)
 
   assertEquals(parts.length, 2)
   assertEquals(await parts[0].text(), 'one')

@@ -39,7 +39,7 @@ Or use the prollyfill (auto-installed on import):
 import 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
 const response = await fetch('/stream')
-for await (const part of response.multipart()) {
+for await (const part of response.parts()) {
   await part.text()
 }
 ```
@@ -49,7 +49,7 @@ for await (const part of response.multipart()) {
 Each part implements the same [`Body`](https://developer.mozilla.org/en-US/docs/Web/API/Body) interface as `Response` and `Request`:
 
 ```js
-for await (const part of response.multipart()) {
+for await (const part of response.parts()) {
   await part.text()         // string
   await part.json()         // any
   await part.bytes()        // Uint8Array
@@ -107,7 +107,7 @@ Errors are `MultipartParseError`, which extends `TypeError` (matching the [WHATW
 import { MultipartParseError } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-multipart@main/fetch-multipart.js'
 
 try {
-  for await (const part of response.multipart()) { /* ... */ }
+  for await (const part of response.parts()) { /* ... */ }
 } catch (err) {
   err instanceof TypeError              // true
   err instanceof MultipartParseError    // true
