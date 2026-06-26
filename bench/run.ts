@@ -23,7 +23,7 @@ import {
   typicalHtmlBurstWithContentLength,
 } from './messages.ts'
 
-import { parseMultipartStream as oursParseStream } from '../fetch-multipart.js'
+import '../fetch-multipart.js'
 import { parseMultipartStream as remixParseStream } from 'npm:@remix-run/multipart-parser'
 
 interface Scenario {
@@ -54,18 +54,31 @@ interface Parser {
   parse(message: MultipartMessage): Promise<number>
 }
 
+// Drain each part's body so both parsers do equivalent work. fetch-multipart
+// yields parts at end-of-headers and streams bodies on demand; remix yields
+// parts after buffering each body. Without the drain, ours would skip body
+// allocation entirely and the comparison would be unfair.
+async function drainStream(stream: ReadableStream<Uint8Array>) {
+  const reader = stream.getReader()
+  while (!(await reader.read()).done) {}
+}
+
 const parsers: Parser[] = [
   {
     name: 'fetch-multipart',
     async parse(message) {
+      const response = new Response(message.toReadableStream(), {
+        headers: { 'content-type': `multipart/mixed; boundary=${message.boundary}` },
+      })
       const start = performance.now()
-      for await (const _ of oursParseStream(message.toReadableStream(), message.boundary)) {
-        void _
+      for await (const part of response.parts()) {
+        await drainStream(part.body)
       }
       return performance.now() - start
     },
   },
   {
+    // remix buffers each body before yielding; iterating already does the work.
     name: '@remix-run/multipart-parser',
     async parse(message) {
       const start = performance.now()
