@@ -147,7 +147,15 @@ export class MultipartParser {
     return this.#activePart
   }
 
-  *write(chunk) {
+  /**
+   * Feed a chunk to the parser. Invokes `onPart` (if provided) for each
+   * BodyPart that opens during this call. Body bytes for the active part
+   * are routed to its body stream synchronously.
+   *
+   * @param {Uint8Array} chunk
+   * @param {((part: BodyPart) => void) | null} [onPart]
+   */
+  write(chunk, onPart = null) {
     // Discard epilogue bytes after the closing boundary (RFC 2046 §5.1.1).
     if (this.#state === State.DONE) return
 
@@ -236,7 +244,7 @@ export class MultipartParser {
         index = headerEndIndex + 4 // skip \r\n\r\n
         const contentLength = extractContentLength(this.#currentHeader)
         this.#activePart = new BodyPart(this.#currentHeader, this.onPull)
-        yield this.#activePart
+        if (onPart) onPart(this.#activePart)
         if (contentLength >= 0) {
           this.#remainingBodyBytes = contentLength
           this.#state = State.READING_BODY_WITH_CONTENT_LENGTH
@@ -658,60 +666,61 @@ async function* iterateStreamParts(stream, boundary) {
   const parser = new MultipartParser(boundary)
   const reader = stream.getReader()
 
-  const partQueue = []
+  // Head-pointer queue. shift() is O(1) on Arrays in V8 for queue-like usage,
+  // but head-pointer avoids index walking entirely and lets us hoist the
+  // common "queue has next part" fast path.
+  const queue = []
+  let head = 0
   let sourceDone = false
   let sourceError = null
   let pumpInflight = null
 
-  async function pumpOnce() {
-    try {
-      const { done, value } = await reader.read()
-      if (done) {
+  const enqueuePart = (part) => queue.push(part)
+
+  async function pump() {
+    if (pumpInflight) return pumpInflight
+    pumpInflight = (async () => {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          sourceDone = true
+          try { parser.finish() } catch (err) { sourceError = err }
+          return
+        }
+        if (value.length > 0) parser.write(value, enqueuePart)
+      } catch (err) {
+        sourceError = err
         sourceDone = true
-        try { parser.finish() } catch (err) { sourceError = err }
-        return
+        parser.abortActive(err)
+      } finally {
+        pumpInflight = null
       }
-      if (value.length === 0) return
-      for (const part of parser.write(value)) partQueue.push(part)
-    } catch (err) {
-      sourceError = err
-      sourceDone = true
-      parser.abortActive(err)
-    }
+    })()
+    return pumpInflight
   }
 
-  async function pumpUntil(predicate) {
-    while (!predicate()) {
-      if (pumpInflight) {
-        await pumpInflight
-        continue
-      }
-      pumpInflight = pumpOnce().finally(() => { pumpInflight = null })
-      await pumpInflight
-    }
+  parser.onPull = async (part) => {
+    while (!sourceDone && !sourceError && part._wantsMore()) await pump()
   }
-
-  parser.onPull = (part) =>
-    pumpUntil(() => sourceDone || sourceError !== null || !part._wantsMore())
 
   try {
     while (true) {
-      if (partQueue.length > 0) {
-        yield partQueue.shift()
+      if (head < queue.length) {
+        const part = queue[head++]
+        if (head === queue.length) { queue.length = 0; head = 0 }
+        yield part
         continue
       }
       if (sourceError) throw sourceError
       if (sourceDone) return
 
-      // No part queued and source still running. If the caller iterated past
+      // No queued parts and source still running. If the caller iterated past
       // an unread body, drop subsequent bytes for it while we scan for the
       // next boundary.
       const active = parser.activePart
       if (active) active._drain()
 
-      await pumpUntil(() =>
-        partQueue.length > 0 || sourceDone || sourceError !== null,
-      )
+      await pump()
     }
   } finally {
     reader.releaseLock()

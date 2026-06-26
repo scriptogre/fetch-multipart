@@ -154,7 +154,7 @@ import { MultipartParser } from 'https://cdn.jsdelivr.net/gh/scriptogre/fetch-mu
 const parser = new MultipartParser(boundary)
 const parts = []
 for (const chunk of chunks) {
-  for (const part of parser.write(chunk)) parts.push(part)
+  parser.write(chunk, (part) => parts.push(part))
 }
 parser.finish()
 

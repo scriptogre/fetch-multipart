@@ -11,7 +11,7 @@ export class MultipartParseError extends TypeError {
 export class MultipartParser {
   constructor(boundary: string)
   readonly boundary: string
-  write(chunk: Uint8Array): Generator<BodyPart, void, unknown>
+  write(chunk: Uint8Array, onPart?: ((part: BodyPart) => void) | null): void
   finish(): void
 }
 
